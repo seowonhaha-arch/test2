@@ -64,12 +64,23 @@ window.addEventListener('load', function() {
 
 <script type="text/plain" id="app-src">
 // ════════════════════════════════════════════════════════════════════
-//  자산 관제 콘솔 · PF-10 (국내외 API 완벽 분기 통합)
+//  자산 관제 콘솔 · PF-11 (조회 실패 수정 + 무료운영 최적화 + UX 개선)
+//
+//  [PF-11 변경사항]
+//  · 조회 실패 수정: 국내 검색결과의 코드/이름 스왑 대응(Worker v2 필수),
+//    해외거래소 티커(.MX 등) 검색결과 제외 — Finnhub 무료는 미국만 지원
+//  · 오류 안내 개선: 429(한도초과)/401(인증)/403(도메인)/네트워크를 구분해 표시
+//  · 요청 타임아웃 12초 추가 (무한 대기 방지)
+//  · 무료 한도 절약: 국내 종목은 Finnhub metric 미호출, 검색 디바운스 300ms,
+//    선택 완료된 티커(.KS/.KQ)는 재검색 안 함
+//  · 신규 기능: 전일 대비 등락률 표시(미국·국내·코인), 트리거까지 남은 %p,
+//    자산 추이 스파크라인(시세 갱신한 날 자동 기록), 종목코드(숫자)로 국내 검색
+//  · 기존 저장 데이터(v8)는 그대로 유지됩니다
 // ════════════════════════════════════════════════════════════════════
 
 // ═══ [1] CONFIG ═════════════════════════════════════════════════════
 
-const APP_VERSION = "PF-10";
+const APP_VERSION = "PF-11";
 const SCHEMA_VERSION = 8;
 const STORAGE_KEY = "portfolio-data-v8";
 const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
@@ -160,6 +171,8 @@ function normalizeHolding(raw) {
     var t = toNum(h[k], HOLDING_DEFAULTS[k]);
     h[k] = t === 0 ? 0 : -Math.abs(t);
   });
+  var dp = raw ? raw.dayPct : null;
+  h.dayPct = (dp == null || !isFinite(Number(dp))) ? null : Number(dp);
   return h;
 }
 
@@ -170,6 +183,8 @@ function normalizePhase2(raw) {
   p.name = p.name || p.ticker;
   p.isKRW = !!p.isKRW;
   ["qty", "avgPrice", "price", "high52", "divPerShare"].forEach(function (k) { p[k] = Math.max(0, toNum(p[k], 0)); });
+  var dp = raw ? raw.dayPct : null;
+  p.dayPct = (dp == null || !isFinite(Number(dp))) ? null : Number(dp);
   return p;
 }
 
@@ -183,6 +198,9 @@ function normalizeState(raw) {
     exchangeRate: toNum(raw.exchangeRate, 1480) > 0 ? toNum(raw.exchangeRate, 1480) : 1480,
     bilMinPct: Math.max(0, toNum(raw.bilMinPct, 10)),
     goals: { finalGoalKRW: Math.max(0, toNum(goalsRaw.finalGoalKRW, DEFAULT_GOALS.finalGoalKRW)), dividendGoalKRW: Math.max(0, toNum(goalsRaw.dividendGoalKRW, DEFAULT_GOALS.dividendGoalKRW)) },
+    history: Array.isArray(raw.history)
+      ? raw.history.filter(function (x) { return x && typeof x.d === "string" && isFinite(Number(x.v)); }).map(function (x) { return { d: x.d, v: Math.round(Number(x.v)) }; }).slice(-370)
+      : [],
     lastPriceSync: typeof raw.lastPriceSync === "string" ? raw.lastPriceSync : null,
     lastBackupAt: typeof raw.lastBackupAt === "string" ? raw.lastBackupAt : null,
     lastUpdated: typeof raw.lastUpdated === "string" ? raw.lastUpdated : null
@@ -190,7 +208,7 @@ function normalizeState(raw) {
 }
 
 function serializeState(s) {
-  return { schemaVersion: SCHEMA_VERSION, holdings: s.holdings, phase2: s.phase2, bilBalance: s.bilBalance, exchangeRate: s.exchangeRate, bilMinPct: s.bilMinPct, goals: s.goals, lastPriceSync: s.lastPriceSync, lastBackupAt: s.lastBackupAt, lastUpdated: new Date().toISOString() };
+  return { schemaVersion: SCHEMA_VERSION, holdings: s.holdings, phase2: s.phase2, bilBalance: s.bilBalance, exchangeRate: s.exchangeRate, bilMinPct: s.bilMinPct, goals: s.goals, history: s.history || [], lastPriceSync: s.lastPriceSync, lastBackupAt: s.lastBackupAt, lastUpdated: new Date().toISOString() };
 }
 
 function loadPersistedState() {
@@ -216,10 +234,37 @@ function underCooldown(key, ms) { return Date.now() - (__cooldowns[key] || 0) < 
 function markCooldown(key) { __cooldowns[key] = Date.now(); }
 function cooldownLeft(key, ms) { return Math.max(1, Math.ceil((ms - (Date.now() - (__cooldowns[key] || 0))) / 1000)); }
 
+// 타임아웃(12초) + 서버가 보낸 오류 메시지(detail) 추출
 async function fetchJson(url, options) {
-  var res = await fetch(url, options);
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  return res.json();
+  var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 12000) : null;
+  var opts = Object.assign({}, options || {}, ctrl ? { signal: ctrl.signal } : {});
+  try {
+    var res = await fetch(url, opts);
+    var data = null;
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      var msg = (data && (data.detail || data.error)) ? String(data.detail || data.error) : ("HTTP " + res.status);
+      var err = new Error(msg);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// 상태코드/메시지에 따라 "무엇이 문제고 어떻게 하면 되는지"를 알려주는 안내문 생성
+function friendlyApiError(e, prefix) {
+  var st = e && e.status;
+  var m = String((e && e.message) || "");
+  if (st === 429) return prefix + " — API 호출 한도 초과예요. 1분쯤 후에 다시 시도해 주세요";
+  if (st === 401) return prefix + " — 프록시 인증 실패예요 (Worker의 CLIENT_SECRET과 앱의 CLIENT_KEY 일치 확인)";
+  if (st === 403) return prefix + " — 허용되지 않은 도메인이에요 (Worker의 ALLOWED_ORIGINS 확인)";
+  if (/abort/i.test(m)) return prefix + " — 응답이 너무 느려요. 잠시 후 다시 시도해 주세요";
+  if (/Failed to fetch|NetworkError|load failed/i.test(m)) return prefix + " — 네트워크 연결을 확인해 주세요";
+  return prefix + (m ? " — " + m.slice(0, 90) : " — 잠시 후 다시 시도해 주세요");
 }
 
 function proxyOpts() {
@@ -227,18 +272,20 @@ function proxyOpts() {
 }
 
 async function apiQuote(ticker, isKRW) {
-  var isKr = isKRW || ticker.endsWith(".KS") || ticker.endsWith(".KQ");
+  var isKr = isKRW || /\.(KS|KQ)$/i.test(ticker);
   var endpoint = isKr ? "kr_quote" : "quote";
 
   var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&symbol=" + encodeURIComponent(ticker), proxyOpts());
-  if (!d) throw new Error("no quote");
+  if (!d) throw new Error("응답 없음");
 
   if (isKr) {
-    if (typeof d.c !== "number" || isNaN(d.c)) throw new Error("KIS no quote");
-    return { price: d.c, dayHigh: d.h || 0, high52: d.w52h || 0 };
+    if (typeof d.c !== "number" || !isFinite(d.c)) throw new Error("국내 시세 응답 오류 (종목코드 확인)");
+    var dpKr = (typeof d.pc === "number" && d.pc > 0) ? ((d.c - d.pc) / d.pc) * 100 : null;
+    return { price: d.c, dayHigh: d.h || 0, high52: d.w52h || 0, dayPct: dpKr };
   } else {
-    if (typeof d.c !== "number" || (d.c === 0 && d.h === 0)) throw new Error("Finnhub no quote");
-    return { price: d.c, dayHigh: d.h || 0, high52: 0 };
+    if (typeof d.c !== "number" || (d.c === 0 && d.h === 0)) throw new Error("미국 시세 응답 오류 (티커 확인)");
+    var dpUs = (typeof d.dp === "number" && isFinite(d.dp)) ? d.dp : ((typeof d.pc === "number" && d.pc > 0) ? ((d.c - d.pc) / d.pc) * 100 : null);
+    return { price: d.c, dayHigh: d.h || 0, high52: 0, dayPct: dpUs };
   }
 }
 
@@ -254,10 +301,16 @@ async function apiMetric(ticker) {
 }
 
 async function apiSearch(q) {
-  var hasKorean = /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/.test(q);
-  var endpoint = hasKorean ? "kr_search" : "search";
-  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&q=" + encodeURIComponent(q), proxyOpts());
+  var t = q.trim();
+  var hasKorean = /[ㄱ-ㅎㅏ-ㅣ가-힣]/.test(t);
+  var looksLikeKrCode = /^\d{4,6}$/.test(t);
+  var endpoint = (hasKorean || looksLikeKrCode) ? "kr_search" : "search";
+  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&q=" + encodeURIComponent(t), proxyOpts());
   var all = (d && d.result) || [];
+  if (endpoint === "search") {
+    // Finnhub 무료 플랜은 미국 상장만 시세를 지원 → 해외 거래소 티커(. 또는 : 포함)는 제외
+    all = all.filter(function (r) { return r && r.symbol && r.symbol.indexOf(".") === -1 && r.symbol.indexOf(":") === -1; });
+  }
   return all.slice(0, 6);
 }
 
@@ -265,9 +318,15 @@ async function apiCryptoPrices(tickers) {
   var ids = [];
   tickers.forEach(function (t) { var id = CRYPTO_IDS[t]; if (id && ids.indexOf(id) === -1) ids.push(id); });
   if (!ids.length) return {};
-  var d = await fetchJson(COINGECKO_URL + "?ids=" + ids.join(",") + "&vs_currencies=usd");
+  var d = await fetchJson(COINGECKO_URL + "?ids=" + ids.join(",") + "&vs_currencies=usd&include_24hr_change=true");
   var out = {};
-  tickers.forEach(function (t) { var id = CRYPTO_IDS[t]; if (id && d[id] && typeof d[id].usd === "number") out[t] = d[id].usd; });
+  tickers.forEach(function (t) {
+    var id = CRYPTO_IDS[t];
+    if (id && d[id] && typeof d[id].usd === "number") {
+      var ch = d[id].usd_24h_change;
+      out[t] = { price: d[id].usd, dayPct: (typeof ch === "number" && isFinite(ch)) ? ch : null };
+    }
+  });
   return out;
 }
 
@@ -291,10 +350,20 @@ function statusOf(h) {
   return "normal";
 }
 
+// 다음 매수 트리거까지 남은 하락폭(%p) 안내문
+function triggerGapText(h) {
+  var st = statusOf(h);
+  var d = dropPct(h);
+  if (st === "normal" && typeof h.t1 === "number" && h.t1 < 0) return "1차 트리거까지 " + (d - h.t1).toFixed(1) + "%p";
+  if (st === "t1" && typeof h.t2 === "number" && h.t2 < 0) return "2차 트리거까지 " + (d - h.t2).toFixed(1) + "%p";
+  return null;
+}
+
 function applyQuoteToAsset(a, q) {
   var next = Object.assign({}, a, { price: q.price });
   next.high52 = Math.max(toNum(a.high52, 0), q.price, toNum(q.dayHigh, 0), toNum(q.metricHigh, 0));
   if (q.div != null) next.divPerShare = q.div;
+  if (q.dayPct !== undefined) next.dayPct = q.dayPct;
   return next;
 }
 
@@ -398,6 +467,32 @@ function useArmed(ms) {
     return true;
   }
   return [armed, fire];
+}
+
+// 전일 대비 등락률 칩 (미국·국내·코인 공용)
+function DayChange({ pct }) {
+  if (pct == null || !isFinite(pct) || Math.abs(pct) > 500) return null;
+  var up = pct >= 0;
+  return <span className="mono" style={{ color: up ? "#3DDC97" : "#FF5C5C", fontSize: "10px" }}>오늘 {up ? "+" : ""}{pct.toFixed(1)}%</span>;
+}
+
+// 자산 추이 미니 차트
+function Sparkline({ data, color }) {
+  if (!data || data.length < 2) return null;
+  var W = 300, H = 40;
+  var vs = data.map(function (p) { return p.v; });
+  var min = Math.min.apply(null, vs), max = Math.max.apply(null, vs);
+  var span = (max - min) || 1;
+  var pts = data.map(function (p, i) {
+    var x = (i / (data.length - 1)) * (W - 4) + 2;
+    var y = H - 3 - ((p.v - min) / span) * (H - 6);
+    return x.toFixed(1) + "," + y.toFixed(1);
+  }).join(" ");
+  return (
+    <svg width="100%" height={H} viewBox={"0 0 " + W + " " + H} preserveAspectRatio="none" style={{ display: "block" }}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.6" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 function ToastHost({ toasts, onClose }) {
@@ -512,7 +607,7 @@ function ActionPanel({ summary, onJumpHolding, onJumpBil }) {
   );
 }
 
-function SummaryPanel({ summary, goals }) {
+function SummaryPanel({ summary, goals, history }) {
   const s = summary;
   return (
     <div className="panel rounded-lg p-5">
@@ -534,6 +629,24 @@ function SummaryPanel({ summary, goals }) {
           <div className="mono text-2xl font-bold" style={{ color: s.triggeredCount > 0 ? "#FFB020" : "#3DDC97" }}>{s.triggeredCount}건</div>
         </div>
       </div>
+
+      {history && history.length >= 2 && (function () {
+        var view = history.slice(-90);
+        var first = view[0].v, last = view[view.length - 1].v;
+        var chg = first > 0 ? ((last - first) / first) * 100 : 0;
+        var up = last >= first;
+        var col = up ? "#3DDC97" : "#FF5C5C";
+        return (
+          <div className="mt-4 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+            <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "11px" }}>
+              <span>자산 추이 · 최근 {view.length}일 기록</span>
+              <span className="mono" style={{ color: col }}>{(chg >= 0 ? "+" : "") + chg.toFixed(1) + "%"}</span>
+            </div>
+            <Sparkline data={view} color={col} />
+            <div className="mt-1" style={{ color: "#4A535C", fontSize: "9px" }}>시세를 갱신한 날의 총자산이 자동으로 기록돼요</div>
+          </div>
+        );
+      })()}
 
       <div className="mt-5">
         <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
@@ -693,6 +806,7 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
   const remainingAmount = remainingQty * h.price;
   const targetProgress = targetQty > 0 ? Math.min(100, (h.qty / targetQty) * 100) : 0;
   const sym = h.isKRW ? "₩" : "$";
+  const gapText = triggerGapText(h);
 
   return (
     <div ref={registerRef} className="panel rounded-lg overflow-hidden">
@@ -706,7 +820,10 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
               {h.isCrypto && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "10px" }}>코인</span>}
               {h.isKRW && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#B18CFF", fontSize: "10px" }}>국내</span>}
             </div>
-            <div className="mt-0.5" style={{ color: meta.color, fontSize: "11px" }}>{meta.label} · {d.toFixed(1)}%</div>
+            <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+              <span style={{ color: meta.color, fontSize: "11px" }}>{meta.label} · {d.toFixed(1)}%</span>
+              <DayChange pct={h.dayPct} />
+            </div>
           </div>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
@@ -760,6 +877,7 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
                   수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtCurrency(prf, h.isKRW)})
                 </div>
               )}
+              {gapText && <div className="mono mt-0.5" style={{ color: "#8B96A5", fontSize: "10px" }}>{gapText} 남음</div>}
             </div>
             <div className="text-right mono" style={{ color: "#8B96A5", fontSize: "11px" }}>비중 {(weightPct || 0).toFixed(1)}%</div>
           </div>
@@ -798,7 +916,10 @@ function Phase2Card({ p, onChange, onRefresh, busy, refreshDisabled, weightPct }
             <span className="mono font-bold text-sm">{p.ticker}</span>
             <span style={{ color: "#8B96A5", fontSize: "12px" }}>{p.name}</span>
           </div>
-          <div style={{ color: "#8B96A5", fontSize: "11px" }} className="mt-0.5">고점대비 {d.toFixed(1)}%</div>
+          <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+            <span style={{ color: "#8B96A5", fontSize: "11px" }}>고점대비 {d.toFixed(1)}%</span>
+            <DayChange pct={p.dayPct} />
+          </div>
         </div>
         <button onClick={onRefresh} disabled={busy || refreshDisabled} aria-label={p.ticker + " 시세 갱신"} className="p-2 hover:bg-gray-800 rounded">
           <RefreshCw size={15} color="#4FD1C5" className={busy ? "animate-spin" : ""} />
@@ -856,21 +977,23 @@ function AddHoldingForm({ onAdd, onCancel }) {
   const searchTimer = useRef(null);
 
   useEffect(() => {
-    if (isCrypto || ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
+    var t = ticker.trim();
+    // 선택 완료된 국내 티커(.KS/.KQ)는 재검색하지 않음 → 불필요한 API 호출 절약
+    if (isCrypto || t.length < 1 || /\.(KS|KQ)$/i.test(t)) { setSuggestions([]); setShowSuggestions(false); return; }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const list = await apiSearch(ticker);
+        const list = await apiSearch(t);
         setSuggestions(list);
         setShowSuggestions(list.length > 0);
       } catch (e) {} finally { setSearching(false); }
-    }, 200); 
+    }, 300);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
   }, [ticker, isCrypto]);
 
   useEffect(() => {
-    if (ticker.endsWith(".KS") || ticker.endsWith(".KQ")) setIsKRW(true);
+    if (/\.(KS|KQ)$/i.test(ticker)) setIsKRW(true);
   }, [ticker]);
 
   async function selectSuggestion(item) {
@@ -882,18 +1005,26 @@ function AddHoldingForm({ onAdd, onCancel }) {
     setNote("");
     setAutoFilling(true);
     try {
-      var isKorean = item.symbol.endsWith(".KS") || item.symbol.endsWith(".KQ");
+      var isKorean = /\.(KS|KQ)$/i.test(item.symbol) || item.type === "KR";
       if (isKorean) setIsKRW(true);
-      
+
       const q = await apiQuote(item.symbol, isKorean).catch(() => null);
       if (q) {
         setPrice(q.price);
         setHigh52(Math.max(q.price, q.dayHigh || 0, q.high52 || 0));
       }
-      const m = await apiMetric(item.symbol);
-      if (m.div != null) setDivPerShare(m.div);
-      if (m.high52 > 0) setHigh52((prev) => Math.max(prev, m.high52));
-      setAutoFilled(true);
+      if (!isKorean) {
+        // 국내 종목은 Finnhub metric을 지원하지 않으므로 호출하지 않음 (무료 한도 절약)
+        const m = await apiMetric(item.symbol);
+        if (m.div != null) setDivPerShare(m.div);
+        if (m.high52 > 0) setHigh52((prev) => Math.max(prev, m.high52));
+      }
+      if (q) {
+        setAutoFilled(true);
+        if (isKorean) setNote("국내 종목은 배당을 자동으로 못 가져와요 — 연배당은 직접 입력해 주세요");
+      } else {
+        setNote("시세 자동 채우기 실패 — 현재가를 직접 입력해 주세요");
+      }
     } catch (e) {
       setNote("자동 채우기 실패 — 시세를 직접 입력해 주세요");
     } finally {
@@ -908,8 +1039,9 @@ function AddHoldingForm({ onAdd, onCancel }) {
     setAutoFilling(true); setNote("");
     try {
       const prices = await apiCryptoPrices([t]);
-      if (prices[t] == null) throw new Error("no price");
-      setPrice(prices[t]); setHigh52((prev) => Math.max(prev, prices[t]));
+      const pr = prices[t];
+      if (!pr) throw new Error("no price");
+      setPrice(pr.price); setHigh52((prev) => Math.max(prev, pr.price));
       setAutoFilled(true);
     } catch (e) { setNote("코인 시세 조회 실패 — 직접 입력해 주세요"); } finally { setAutoFilling(false); }
   }
@@ -918,13 +1050,14 @@ function AddHoldingForm({ onAdd, onCancel }) {
     <div className="panel rounded-lg p-4 mb-2 space-y-3">
       <div className="grid grid-cols-2 gap-2">
         <div className="relative">
-          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 {!isCrypto && <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요</span>}</div>
+          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 {!isCrypto && <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요 (국내는 이름/종목코드)</span>}</div>
           <input value={ticker} onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }} onFocus={() => setShowSuggestions(suggestions.length > 0)} onBlur={() => setTimeout(() => setShowSuggestions(false), 150)} className="tinput mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
           {searching && <div style={{ position: "absolute", right: 8, top: 30, fontSize: "10px", color: "#5C666F" }}>검색중</div>}
           
           {showSuggestions && (
-            <div className="absolute z-20 w-[140%] mt-1 rounded-md overflow-hidden" 
+            <div className="absolute z-20 mt-1 rounded-md overflow-hidden" 
                  style={{ 
+                   width: "min(340px, 82vw)",
                    background: "rgba(15, 23, 31, 0.95)", 
                    backdropFilter: "blur(10px)",
                    border: "1px solid #2B3544", 
@@ -1001,8 +1134,8 @@ function SettingsModal({ onClose, exchangeRate, onRateChange, onFetchFx, fxBusy,
         </div>
 
         <div className="pt-1 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
-          <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 활성화됨</div>
-          <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 백엔드 서버에만 안전하게 고정되어 브라우저에 노출되지 않습니다.</div>
+          <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 v2 활성화됨</div>
+          <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 서버(Worker)에만 저장돼요. 캐시는 메모리 기반이라 무료 한도(KV 쓰기)를 아껴요.</div>
         </div>
 
         <div className="flex items-end gap-2">
@@ -1063,6 +1196,7 @@ function PortfolioConsole() {
   const [exchangeRate, setExchangeRate] = useState(1480);
   const [bilMinPct, setBilMinPct] = useState(10);
   const [goals, setGoals] = useState(() => Object.assign({}, DEFAULT_GOALS));
+  const [history, setHistory] = useState([]);
   const [lastPriceSync, setLastPriceSync] = useState(null);
   const [lastBackupAt, setLastBackupAt] = useState(null);
 
@@ -1102,6 +1236,7 @@ function PortfolioConsole() {
       setExchangeRate(st.exchangeRate);
       setBilMinPct(st.bilMinPct);
       setGoals(st.goals);
+      setHistory(st.history);
       setLastPriceSync(st.lastPriceSync);
       setLastBackupAt(st.lastBackupAt);
       if (st.lastUpdated) setLastSaved(st.lastUpdated);
@@ -1114,7 +1249,7 @@ function PortfolioConsole() {
     if (!loaded) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt });
+      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, history, lastPriceSync, lastBackupAt });
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         setSaveError(false);
@@ -1124,7 +1259,7 @@ function PortfolioConsole() {
       }
     }, 700);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt, loaded]);
+  }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, history, lastPriceSync, lastBackupAt, loaded]);
 
   const makeFieldUpdater = (setList) => (id, field, v) => {
     setList((prev) => prev.map((x) => {
@@ -1185,12 +1320,13 @@ function PortfolioConsole() {
       setBusyKey(asset.id);
       try {
         var prices = await apiCryptoPrices([asset.ticker]);
-        if (prices[asset.ticker] == null) throw new Error("no price");
-        applyToList(scope, asset.id, { price: prices[asset.ticker], dayHigh: 0, metricHigh: 0, div: null });
+        var pr = prices[asset.ticker];
+        if (!pr) throw new Error("시세 응답 없음");
+        applyToList(scope, asset.id, { price: pr.price, dayHigh: 0, metricHigh: 0, div: null, dayPct: pr.dayPct });
         markCooldown(ckey);
         setLastPriceSync(new Date().toISOString());
       } catch (e) {
-        toast("error", asset.ticker + " 시세 조회 실패 — 잠시 후 다시 시도하거나 직접 입력해 주세요");
+        toast("error", friendlyApiError(e, asset.ticker + " 시세 조회 실패"));
       } finally {
         setBusyKey(null);
       }
@@ -1204,18 +1340,18 @@ function PortfolioConsole() {
     }
     setBusyKey(asset.id);
     try {
-      var isKr = asset.isKRW || asset.ticker.endsWith(".KS") || asset.ticker.endsWith(".KQ");
+      var isKr = asset.isKRW || /\.(KS|KQ)$/i.test(asset.ticker);
       if (isKr) {
         var q = await apiQuote(asset.ticker, true);
-        applyToList(scope, asset.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null });
+        applyToList(scope, asset.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null, dayPct: q.dayPct });
       } else {
         var results = await Promise.all([apiQuote(asset.ticker, false), apiMetric(asset.ticker)]);
-        applyToList(scope, asset.id, { price: results[0].price, dayHigh: results[0].dayHigh, metricHigh: results[1].high52, div: results[1].div });
+        applyToList(scope, asset.id, { price: results[0].price, dayHigh: results[0].dayHigh, metricHigh: results[1].high52, div: results[1].div, dayPct: results[0].dayPct });
       }
       markCooldown(skey);
       setLastPriceSync(new Date().toISOString());
     } catch (e) {
-      toast("error", asset.ticker + " 조회 실패 — 티커를 확인해 주세요");
+      toast("error", friendlyApiError(e, asset.ticker + " 조회 실패"));
     } finally {
       setBusyKey(null);
     }
@@ -1247,7 +1383,7 @@ function PortfolioConsole() {
         setHoldings((prev) => prev.map((x) => {
           if (!x.isCrypto) return x;
           var pr = cp[x.ticker];
-          return pr == null ? x : applyQuoteToAsset(x, { price: pr, dayHigh: 0, metricHigh: 0, div: null });
+          return pr == null ? x : applyQuoteToAsset(x, { price: pr.price, dayHigh: 0, metricHigh: 0, div: null, dayPct: pr.dayPct });
         }));
         cryptoTickers.forEach((t) => { if (cp[t] == null) failed.push(t); });
       } catch (e) {
@@ -1259,13 +1395,13 @@ function PortfolioConsole() {
     for (var i = 0; i < stockTargets.length; i++) {
       var tgt = stockTargets[i];
       try {
-        var isKr = tgt.isKRW || tgt.ticker.endsWith(".KS") || tgt.ticker.endsWith(".KQ");
+        var isKr = tgt.isKRW || /\.(KS|KQ)$/i.test(tgt.ticker);
         if (isKr) {
           var q = await apiQuote(tgt.ticker, true);
-          applyToList(tgt.scope, tgt.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null });
+          applyToList(tgt.scope, tgt.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null, dayPct: q.dayPct });
         } else {
           var r = await Promise.all([apiQuote(tgt.ticker, false), apiMetric(tgt.ticker)]);
-          applyToList(tgt.scope, tgt.id, { price: r[0].price, dayHigh: r[0].dayHigh, metricHigh: r[1].high52, div: r[1].div });
+          applyToList(tgt.scope, tgt.id, { price: r[0].price, dayHigh: r[0].dayHigh, metricHigh: r[1].high52, div: r[1].div, dayPct: r[0].dayPct });
         }
       } catch (e) {
         failed.push(tgt.ticker);
@@ -1288,7 +1424,7 @@ function PortfolioConsole() {
       setExchangeRate(await apiFxKRW());
       toast("success", "환율을 갱신했어요");
     } catch (e) {
-      toast("error", "환율 자동 조회 실패 — 직접 입력해 주세요");
+      toast("error", friendlyApiError(e, "환율 자동 조회 실패"));
     } finally {
       setFxBusy(false);
     }
@@ -1296,7 +1432,7 @@ function PortfolioConsole() {
 
   function handleExportData() {
     try {
-      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt });
+      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, history, lastPriceSync, lastBackupAt });
       var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
       var url = URL.createObjectURL(blob);
       var a = document.createElement("a");
@@ -1330,6 +1466,7 @@ function PortfolioConsole() {
         setExchangeRate(st.exchangeRate);
         setBilMinPct(st.bilMinPct);
         setGoals(st.goals);
+        setHistory(st.history);
         setLastPriceSync(st.lastPriceSync);
         setLastBackupAt(st.lastBackupAt);
         toast("success", "백업 복원 완료 · 종목 " + st.holdings.length + "개");
@@ -1348,6 +1485,7 @@ function PortfolioConsole() {
     setExchangeRate(1480);
     setBilMinPct(10);
     setGoals(Object.assign({}, DEFAULT_GOALS));
+    setHistory([]);
     setLastPriceSync(null);
     setLastBackupAt(null);
     setExpandedIds({});
@@ -1358,6 +1496,25 @@ function PortfolioConsole() {
   const priceStale = lastPriceSync && isStale(lastPriceSync, 20);
   const needsInitialSync = !hasRefreshedThisSession && isStale(lastPriceSync, 1);
   const backupStale = !lastBackupAt || isStale(lastBackupAt, 24 * 30);
+
+  // 자산 추이 자동 기록: 오늘 시세를 갱신했다면, 오늘 날짜의 총자산 스냅샷을 저장/갱신
+  useEffect(function () {
+    if (!loaded || !lastPriceSync) return;
+    if (summary.isEmpty || summary.totalValueUSD <= 0) return;
+    var sync = new Date(lastPriceSync);
+    var now = new Date();
+    if (isNaN(sync.getTime()) || sync.toDateString() !== now.toDateString()) return;
+    var key = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
+    var v = Math.round(summary.totalValueKRW);
+    setHistory(function (prev) {
+      var last = prev.length ? prev[prev.length - 1] : null;
+      if (last && last.d === key) {
+        if (last.v === v) return prev;
+        return prev.slice(0, -1).concat([{ d: key, v: v }]);
+      }
+      return prev.concat([{ d: key, v: v }]).slice(-370);
+    });
+  }, [loaded, lastPriceSync, summary.totalValueKRW, summary.totalValueUSD, summary.isEmpty]);
 
   return (
     <div style={{ fontFamily: "'Noto Sans KR', sans-serif", background: "#0B0E11", minHeight: "100vh", color: "#E8ECEF", paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 64px)" }} className="w-full min-h-screen relative">
@@ -1419,7 +1576,7 @@ function PortfolioConsole() {
         )}
 
         <ActionPanel summary={summary} onJumpHolding={jumpToHolding} onJumpBil={jumpToBil} />
-        <SummaryPanel summary={summary} goals={goals} />
+        <SummaryPanel summary={summary} goals={goals} history={history} />
         <AllocationPanel summary={summary} holdings={holdings} phase2={phase2} bilBalance={bilBalance} />
 
         <div>
