@@ -15,7 +15,7 @@
 <!-- 앱 아이콘 지정 (iOS / Android 공용) -->
 <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/2422/2422796.png">
 
-<!-- 인라인 Web App Manifest (별도 manifest.json 파일 없이 1개 파일로 동작) -->
+<!-- 인라인 Web App Manifest (단독 앱 모드 지원) -->
 <link rel="manifest" href='data:application/manifest+json,{
   "name": "자산 관제 콘솔",
   "short_name": "자산관제",
@@ -82,23 +82,21 @@ window.addEventListener('load', function() {
 
 <script type="text/plain" id="app-src">
 // ==========================================
-// 🔑 고정 Finnhub API Key 설정
+// 🛡️ API Key 없는 안전한 Cloudflare 프록시 연동
 // ==========================================
-const HARDCODED_API_KEY = "d9gvf39r01qvjm7ol7k0d9gvf39r01qvjm7ol7kg";
+const PROXY_URL = "https://finnhub-proxy.seowonhaha.workers.dev";
 
 const IconBase = ({ size = 16, color = "currentColor", children, className = "", style = {} }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>{children}</svg>
 );
 const Settings = (p) => <IconBase {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></IconBase>;
 const Plus = (p) => <IconBase {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></IconBase>;
-const Trash2 = (p) => <IconBase {...p}><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></IconBase>;
+const Trash2 = (p) => <IconBase {...p}><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></IconBase>;
 const ChevronDown = (p) => <IconBase {...p}><polyline points="6 9 12 15 18 9"/></IconBase>;
 const ChevronUp = (p) => <IconBase {...p}><polyline points="18 15 12 9 6 15"/></IconBase>;
 const X = (p) => <IconBase {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></IconBase>;
 const AlertTriangle = (p) => <IconBase {...p}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></IconBase>;
 const RefreshCw = (p) => <IconBase {...p}><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></IconBase>;
-const Eye = (p) => <IconBase {...p}><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></IconBase>;
-const EyeOff = (p) => <IconBase {...p}><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.5 18.5 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></IconBase>;
 
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -144,7 +142,6 @@ function PortfolioConsole() {
   const [phase2, setPhase2] = useState(DEFAULT_PHASE2);
   const [bilBalance, setBilBalance] = useState(0);
   const [exchangeRate, setExchangeRate] = useState(1480);
-  const [finnhubKey, setFinnhubKey] = useState(HARDCODED_API_KEY);
 
   const [loaded, setLoaded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -159,13 +156,12 @@ function PortfolioConsole() {
   const [isRefreshingAll, setIsRefreshingAll] = useState(false);
   const bulkCooldownRef = useRef(0);
   const [bilMinPct, setBilMinPct] = useState(10);
-  const [showKey, setShowKey] = useState(false);
   const [expandedIds, setExpandedIds] = useState({});
   const saveTimer = useRef(null);
   const cardRefs = useRef({});
   const bilCardRef = useRef(null);
 
-  const STORAGE_KEY = "portfolio-data-v5";
+  const STORAGE_KEY = "portfolio-data-v6";
 
   useEffect(() => {
     try {
@@ -176,19 +172,11 @@ function PortfolioConsole() {
         if (Array.isArray(data.phase2)) setPhase2(data.phase2);
         if (typeof data.bilBalance === "number") setBilBalance(data.bilBalance);
         if (typeof data.exchangeRate === "number") setExchangeRate(data.exchangeRate);
-        if (typeof data.finnhubKey === "string" && data.finnhubKey.trim() !== "") {
-          setFinnhubKey(data.finnhubKey);
-        } else {
-          setFinnhubKey(HARDCODED_API_KEY);
-        }
         if (typeof data.bilMinPct === "number") setBilMinPct(data.bilMinPct);
         if (data.lastUpdated) setLastSaved(data.lastUpdated);
-      } else {
-        setFinnhubKey(HARDCODED_API_KEY);
       }
     } catch (e) {
       console.warn("데이터 파싱 오류");
-      setFinnhubKey(HARDCODED_API_KEY);
     } finally {
       setLoaded(true);
     }
@@ -198,7 +186,7 @@ function PortfolioConsole() {
     if (!loaded) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      const payload = { holdings, phase2, bilBalance, exchangeRate, finnhubKey, bilMinPct, lastUpdated: new Date().toISOString() };
+      const payload = { holdings, phase2, bilBalance, exchangeRate, bilMinPct, lastUpdated: new Date().toISOString() };
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         setSaveError(false);
@@ -208,7 +196,7 @@ function PortfolioConsole() {
       }
     }, 700);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [holdings, phase2, bilBalance, exchangeRate, finnhubKey, bilMinPct, loaded]);
+  }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, loaded]);
 
   function updateHolding(id, field, value) { setHoldings((prev) => prev.map((h) => (h.id === id ? { ...h, [field]: value } : h))); }
   function removeHolding(id) { setHoldings((prev) => prev.filter((h) => h.id !== id)); }
@@ -251,7 +239,7 @@ function PortfolioConsole() {
 
   async function fetchDividendPerShare(ticker) {
     try {
-      const res = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${finnhubKey}`);
+      const res = await fetch(`${PROXY_URL}?endpoint=metric&symbol=${ticker}`);
       if (!res.ok) return null;
       const data = await res.json();
       const m = data && data.metric;
@@ -262,14 +250,14 @@ function PortfolioConsole() {
       return null;
     }
   }
+
   async function fetchStockLive(ticker, applyFn) {
-    if (!finnhubKey) { setFetchError("Finnhub API Key가 세팅되지 않았습니다."); return; }
     if (Date.now() - (cooldowns[ticker] || 0) < 10000) {
       setFetchError(`${ticker} 조회 쿨타임(10초)입니다.`); return;
     }
     setFetchingId(ticker); setFetchError(null);
     try {
-      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${finnhubKey}`);
+      const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${ticker}`);
       if (!res.ok) throw new Error("fetch failed");
       const data = await res.json();
       if (data.c === 0 && data.h === 0) throw new Error("invalid ticker");
@@ -279,12 +267,14 @@ function PortfolioConsole() {
     } catch (e) { setFetchError(`${ticker} 조회 실패 - 티커를 확인해줘.`); }
     finally { setFetchingId(null); }
   }
+
   function fetchHoldingLive(h) {
     if (h.isCrypto) return fetchCryptoLive(h);
     return fetchStockLive(h.ticker, (price, todayHigh, div) => {
       setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price, high52: Math.max(price, todayHigh, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
     });
   }
+
   function fetchPhase2Live(p) {
     return fetchStockLive(p.ticker, (price, todayHigh, div) => {
       setPhase2((prev) => prev.map((x) => (x.id === p.id ? { ...x, price, high52: Math.max(price, todayHigh, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
@@ -311,45 +301,37 @@ function PortfolioConsole() {
           const price = data[coinId] && data[coinId].usd;
           if (!price) throw new Error();
           setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price, high52: Math.max(price, x.high52) } : x)));
-        } else if (finnhubKey) {
-          const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${h.ticker}&token=${finnhubKey}`);
+        } else {
+          const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${h.ticker}`);
           if (!res.ok) throw new Error();
           const data = await res.json();
           if (data.c === 0 && data.h === 0) throw new Error();
           const div = await fetchDividendPerShare(h.ticker);
           setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price: data.c, high52: Math.max(data.c, data.h, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-        } else {
-          continue;
         }
       } catch (e) {
         failed.push(h.ticker);
       }
-      await new Promise((r) => setTimeout(r, 350));
+      await new Promise((r) => setTimeout(r, 300));
     }
 
-    if (finnhubKey) {
-      for (const p of phase2) {
-        try {
-          const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${p.ticker}&token=${finnhubKey}`);
-          if (!res.ok) throw new Error();
-          const data = await res.json();
-          if (data.c === 0 && data.h === 0) throw new Error();
-          const div = await fetchDividendPerShare(p.ticker);
-          setPhase2((prev) => prev.map((x) => (x.id === p.id ? { ...x, price: data.c, high52: Math.max(data.c, data.h, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-        } catch (e) {
-          failed.push(p.ticker);
-        }
-        await new Promise((r) => setTimeout(r, 350));
+    for (const p of phase2) {
+      try {
+        const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${p.ticker}`);
+        if (!res.ok) throw new Error();
+        const data = await res.json();
+        if (data.c === 0 && data.h === 0) throw new Error();
+        const div = await fetchDividendPerShare(p.ticker);
+        setPhase2((prev) => prev.map((x) => (x.id === p.id ? { ...x, price: data.c, high52: Math.max(data.c, data.h, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
+      } catch (e) {
+        failed.push(p.ticker);
       }
+      await new Promise((r) => setTimeout(r, 300));
     }
 
     bulkCooldownRef.current = Date.now();
     setIsRefreshingAll(false);
-    if (!finnhubKey) {
-      setFetchError("Finnhub API Key가 없어 주식·ETF는 갱신하지 못했어(코인만 갱신됨).");
-    } else if (failed.length > 0) {
-      setFetchError(`일부 조회 실패: ${failed.join(", ")}`);
-    }
+    if (failed.length > 0) setFetchError(`일부 조회 실패: ${failed.join(", ")}`);
   }
 
   const fetchLiveExchangeRate = useCallback(async () => {
@@ -440,7 +422,7 @@ function PortfolioConsole() {
       <div className="panel" style={{ borderLeft: "none", borderRight: "none", borderTop: "none" }}>
         <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between">
           <div>
-            <div className="mono tracking-widest" style={{ color: "#4FD1C5", fontSize: "11px" }}>PF-06 (일괄갱신·배당)</div>
+            <div className="mono tracking-widest" style={{ color: "#4FD1C5", fontSize: "11px" }}>PF-06 (보안 프록시 연동)</div>
             <div className="text-lg font-bold">자산 관제 콘솔</div>
           </div>
           <div className="flex items-center gap-2">
@@ -616,7 +598,7 @@ function PortfolioConsole() {
             </button>
           </div>
 
-          {showAddForm && <AddHoldingForm onAdd={addHolding} onCancel={() => setShowAddForm(false)} finnhubKey={finnhubKey} />}
+          {showAddForm && <AddHoldingForm onAdd={addHolding} onCancel={() => setShowAddForm(false)} />}
 
           <div className="space-y-2">
             {holdings.map((h) => {
@@ -819,16 +801,9 @@ function PortfolioConsole() {
               <div className="text-base font-bold text-white flex items-center gap-2"><Settings size={18} color="#4FD1C5" /> 환경 설정</div>
               <button onClick={() => setShowSettings(false)} className="p-1 hover:bg-gray-800 rounded"><X size={18} color="#8B96A5" /></button>
             </div>
-            <div className="pt-2 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
-              <div className="mb-1" style={{ color: "#E8ECEF", fontSize: "13px", fontWeight: "bold" }}>주식 가격 연동 API (Finnhub)</div>
-              <div style={{ color: "#8B96A5", fontSize: "11px", marginBottom: "8px" }}>기본 API Key가 설정되어 있습니다. 필요시 변경 가능합니다.</div>
-              <div className="relative">
-                <input type={showKey ? "text" : "password"} placeholder="API Key 입력" value={finnhubKey} onChange={(e) => setFinnhubKey(e.target.value)}
-                  className="mono w-full text-sm rounded px-2 py-2 pr-9" style={{ background: "#0B0E11", border: "1px solid #4FD1C5", color: "#E8ECEF" }} />
-                <button type="button" onClick={() => setShowKey((s) => !s)} className="absolute" style={{ right: 8, top: 8 }}>
-                  {showKey ? <EyeOff size={16} color="#8B96A5" /> : <Eye size={16} color="#8B96A5" />}
-                </button>
-              </div>
+            <div className="pt-1 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
+              <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 활성화됨</div>
+              <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 백엔드 서버에만 안전하게 고정되어 브라우저에 노출되지 않습니다.</div>
             </div>
             <div className="flex items-end gap-2">
               <div className="flex-1"><Field label="환율 (₩/$)" value={exchangeRate} onChange={setExchangeRate} /></div>
@@ -893,7 +868,7 @@ function RuleRow({ color, title, desc }) {
   );
 }
 
-function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
+function AddHoldingForm({ onAdd, onCancel }) {
   const [ticker, setTicker] = useState("");
   const [name, setName] = useState("");
   const [category, setCategory] = useState("core");
@@ -916,12 +891,12 @@ function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
   const searchTimer = useRef(null);
 
   useEffect(() => {
-    if (!finnhubKey || ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
+    if (ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await fetch(`https://finnhub.io/api/v1/search?q=${encodeURIComponent(ticker)}&token=${finnhubKey}`);
+        const res = await fetch(`${PROXY_URL}?endpoint=search&q=${encodeURIComponent(ticker)}`);
         if (res.ok) {
           const data = await res.json();
           const list = (data.result || []).slice(0, 6);
@@ -934,7 +909,7 @@ function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
       }
     }, 350);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
-  }, [ticker, finnhubKey]);
+  }, [ticker]);
 
   async function selectSuggestion(item) {
     setTicker(item.symbol);
@@ -942,10 +917,9 @@ function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
     setShowSuggestions(false);
     setSuggestions([]);
     setAutoFilled(false);
-    if (!finnhubKey) return;
     setAutoFilling(true);
     try {
-      const res = await fetch(`https://finnhub.io/api/v1/quote?symbol=${item.symbol}&token=${finnhubKey}`);
+      const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${item.symbol}`);
       let newHigh = 0;
       if (res.ok) {
         const data = await res.json();
@@ -955,7 +929,7 @@ function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
           setHigh52(newHigh);
         }
       }
-      const metricRes = await fetch(`https://finnhub.io/api/v1/stock/metric?symbol=${item.symbol}&metric=all&token=${finnhubKey}`);
+      const metricRes = await fetch(`${PROXY_URL}?endpoint=metric&symbol=${item.symbol}`);
       if (metricRes.ok) {
         const metricData = await metricRes.json();
         const m = metricData && metricData.metric;
@@ -976,7 +950,7 @@ function AddHoldingForm({ onAdd, onCancel, finnhubKey }) {
     <div className="panel rounded-lg p-4 mb-2 space-y-3">
       <div className="grid grid-cols-2 gap-2">
         <div className="relative">
-          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 {finnhubKey && <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 검색돼요</span>}</div>
+          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요</span></div>
           <input
             value={ticker}
             onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }}
