@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>자산 관제 콘솔</title>
 
 <meta name="mobile-web-app-capable" content="yes">
@@ -63,10 +63,401 @@ window.addEventListener('load', function() {
 </script>
 
 <script type="text/plain" id="app-src">
-// ==========================================
-// 🛡️ API Key 없는 안전한 Cloudflare 프록시 연동
-// ==========================================
+// ════════════════════════════════════════════════════════════════════
+//  자산 관제 콘솔 · PF-07
+//
+//  파일은 아래 8개 모듈로 구성됩니다. 기능을 확장할 때는 해당 모듈만
+//  수정하면 되고, UI 컴포넌트는 계산 로직([5])을 몰라도 됩니다.
+//
+//  [1] CONFIG      설정값·기본 데이터. 코인 추가, 쿨타임, 색상 등은 여기 한 곳만 수정
+//  [2] UTILS       포맷/변환 순수 함수
+//  [3] STORAGE     저장·불러오기·버전 마이그레이션(v6→v7 자동)·백업 직렬화
+//  [4] MARKET API  모든 외부 통신(주식/코인/환율) 창구 + 쿨타임 관리
+//  [5] CALC        도메인 계산(트리거 판정, 포트폴리오 집계). 전부 순수 함수
+//  [6] 공용 UI     아이콘, 입력 필드, 토스트, 도넛 차트 등 재사용 부품
+//  [7] 기능 컴포넌트  카드/패널/모달 등 화면 단위 부품
+//  [8] APP         상태 보관과 배선만 담당하는 얇은 최상위 컴포넌트
+// ════════════════════════════════════════════════════════════════════
+
+// ═══ [1] CONFIG ═════════════════════════════════════════════════════
+
+const APP_VERSION = "PF-07";
+const SCHEMA_VERSION = 7;
+const STORAGE_KEY = "portfolio-data-v7";
+// 이전 버전 키. 처음 실행 시 여기서 데이터를 읽어와 v7로 자동 이전합니다.
+// (원본 v6 데이터는 지우지 않고 남겨두어 비상 복구용으로 사용 가능)
+const LEGACY_STORAGE_KEYS = ["portfolio-data-v6"];
+
 const PROXY_URL = "https://finnhub-proxy.seowonhaha.workers.dev";
+const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price";
+const FX_URL = "https://open.er-api.com/v6/latest/USD";
+
+// 자동 시세를 지원할 코인 목록. 새 코인은 여기 한 줄만 추가하면
+// 개별 갱신·전체 갱신·추가 폼 자동 채우기에 모두 반영됩니다.
+// (값은 CoinGecko의 coin id)
+const CRYPTO_IDS = {
+  BTC: "bitcoin",
+  ETH: "ethereum",
+  SOL: "solana",
+  XRP: "ripple",
+  DOGE: "dogecoin",
+  ADA: "cardano",
+  AVAX: "avalanche-2",
+  LINK: "chainlink"
+};
+const SUPPORTED_COINS_LABEL = Object.keys(CRYPTO_IDS).join(", ");
+
+// API 재조회 최소 간격 (ms)
+const COOLDOWN_MS = { stock: 10000, crypto: 30000, bulk: 20000 };
+
+// 목표 금액 기본값 — 실제 값은 설정 화면에서 수정 가능하며 저장됩니다.
+const DEFAULT_GOALS = {
+  finalGoalKRW: 2000000000,   // 2단계 목표 (원)
+  dividendGoalKRW: 80000000   // 3단계 연 배당 목표 (원, 세전)
+};
+
+const CASH_COLOR = "#3B82F6";
+const CATEGORY_COLORS = { core: "#4FD1C5", satellite: "#FFB020", phase2: "#B18CFF", cash: CASH_COLOR };
+const STATUS_META = {
+  normal: { label: "정상", color: "#3DDC97" },
+  t1:     { label: "2배 매수", color: "#FFB020" },
+  t2:     { label: "BIL 집행", color: "#FF5C5C" },
+  done:   { label: "목표 달성", color: "#60A5FA" }
+};
+
+// 새 종목의 누락 필드를 채울 기본값 (마이그레이션에도 사용)
+const HOLDING_DEFAULTS = { category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 0, high52: 0, targetQty: 0, t1: -15, t2: -30, mdd: 0, divPerShare: 0 };
+const PHASE2_DEFAULTS = { qty: 0, avgPrice: 0, price: 0, high52: 0, divPerShare: 0 };
+
+const DEFAULT_HOLDINGS = [
+  { id: "h1", ticker: "TSLA", name: "테슬라", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 400, high52: 463, targetQty: 100, t1: -25, t2: -40, mdd: -74, divPerShare: 0 },
+  { id: "h2", ticker: "SMH", name: "SMH", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 600, high52: 672, targetQty: 40, t1: -15, t2: -25, mdd: -56, divPerShare: 0 },
+  { id: "h3", ticker: "DRAM", name: "Roundhill Memory", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 58.85, high52: 81.34, targetQty: 200, t1: -15, t2: -25, mdd: -30, divPerShare: 0 },
+  { id: "h4", ticker: "GOOGL", name: "구글", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 359.91, high52: 400, targetQty: 30, t1: -10, t2: -20, mdd: -45, divPerShare: 0 },
+  { id: "h5", ticker: "NVDA", name: "엔비디아", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 194.83, high52: 213, targetQty: 50, t1: -20, t2: -35, mdd: -65, divPerShare: 0 },
+  { id: "h6", ticker: "PLTR", name: "팔란티어", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 134.44, high52: 207.52, targetQty: 100, t1: -25, t2: -40, mdd: -85, divPerShare: 0 },
+  { id: "h7", ticker: "QTUM", name: "퀀텀 ETF", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 144.17, high52: 170, targetQty: 100, t1: -15, t2: -25, mdd: -40, divPerShare: 0 },
+  { id: "h8", ticker: "SPCX", name: "스페이스X", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 120, high52: 225.64, targetQty: 200, t1: -20, t2: -40, mdd: -50, divPerShare: 0 },
+  { id: "h9", ticker: "BTC", name: "비트코인", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 66509, high52: 124000, targetQty: 1, t1: -25, t2: -40, mdd: -84, divPerShare: 0 },
+  { id: "h10", ticker: "ETH", name: "이더리움", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 1928.62, high52: 4000, targetQty: 5, t1: -30, t2: -50, mdd: -94, divPerShare: 0 }
+];
+
+const DEFAULT_PHASE2 = [
+  { id: "p1", ticker: "SCHD", name: "SCHD (배당 코어)", qty: 0, avgPrice: 0, price: 32.92, high52: 33.50, divPerShare: 1.05 },
+  { id: "p2", ticker: "SCHG", name: "SCHG (성장 코어)", qty: 0, avgPrice: 0, price: 34.27, high52: 35.42, divPerShare: 0.12 }
+];
+
+// ═══ [2] UTILS ══════════════════════════════════════════════════════
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+function uid() { return "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+function toNum(v, fallback) { var n = Number(v); return isFinite(n) ? n : fallback; }
+
+function fmtUSD(n) { return !isFinite(n) ? "$0" : "$" + Math.round(n).toLocaleString("en-US"); }
+
+function fmtKRWShort(n) {
+  if (!isFinite(n)) return "0원";
+  var sign = n < 0 ? "-" : "";
+  var abs = Math.abs(n);
+  if (abs >= 100000000) {
+    var v = abs / 100000000;
+    var t = v >= 100 ? Math.round(v).toLocaleString("ko-KR") : v.toFixed(2).replace(/\.?0+$/, "");
+    return sign + t + "억원";
+  }
+  if (abs >= 10000) return sign + Math.round(abs / 10000).toLocaleString("ko-KR") + "만원";
+  return sign + Math.round(abs).toLocaleString("ko-KR") + "원";
+}
+
+// iso 시각이 hours 시간보다 오래됐는지 (값이 없으면 오래된 것으로 취급)
+function isStale(iso, hours) {
+  if (!iso) return true;
+  var t = Date.parse(iso);
+  if (!isFinite(t)) return true;
+  return Date.now() - t > hours * 3600000;
+}
+
+function fmtSyncTime(iso) {
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return "-";
+  var now = new Date();
+  var hh = String(d.getHours()).padStart(2, "0");
+  var mm = String(d.getMinutes()).padStart(2, "0");
+  if (d.toDateString() === now.toDateString()) return hh + ":" + mm;
+  return (d.getMonth() + 1) + "/" + d.getDate() + " " + hh + ":" + mm;
+}
+
+// ═══ [3] STORAGE ════════════════════════════════════════════════════
+// 저장 스키마가 바뀌면: SCHEMA_VERSION 올리고, normalize에서 새 필드의
+// 기본값만 채워주면 됩니다. 과거 데이터는 자동으로 보정됩니다.
+
+function normalizeHolding(raw) {
+  var h = Object.assign({}, HOLDING_DEFAULTS, raw || {});
+  h.id = (typeof h.id === "string" && h.id) ? h.id : uid();
+  h.ticker = String(h.ticker || "").toUpperCase();
+  h.name = h.name || h.ticker;
+  h.category = h.category === "satellite" ? "satellite" : "core";
+  h.isCrypto = !!h.isCrypto;
+  ["qty", "avgPrice", "price", "high52", "targetQty", "divPerShare"].forEach(function (k) {
+    h[k] = Math.max(0, toNum(h[k], 0));
+  });
+  // 트리거는 "고점 대비 하락률"이므로 항상 음수여야 합니다.
+  // 과거에 양수로 저장된 값(항상 발동되는 버그 원인)을 음수로 정규화. 0은 미사용.
+  ["t1", "t2", "mdd"].forEach(function (k) {
+    var t = toNum(h[k], HOLDING_DEFAULTS[k]);
+    h[k] = t === 0 ? 0 : -Math.abs(t);
+  });
+  return h;
+}
+
+function normalizePhase2(raw) {
+  var p = Object.assign({}, PHASE2_DEFAULTS, raw || {});
+  p.id = (typeof p.id === "string" && p.id) ? p.id : uid();
+  p.ticker = String(p.ticker || "").toUpperCase();
+  p.name = p.name || p.ticker;
+  ["qty", "avgPrice", "price", "high52", "divPerShare"].forEach(function (k) {
+    p[k] = Math.max(0, toNum(p[k], 0));
+  });
+  return p;
+}
+
+// 어떤 버전의 payload가 와도 항상 완전한 v7 상태 객체로 변환
+function normalizeState(raw) {
+  raw = raw || {};
+  var goalsRaw = raw.goals || {};
+  return {
+    holdings: Array.isArray(raw.holdings) && raw.holdings.length
+      ? raw.holdings.map(normalizeHolding)
+      : DEFAULT_HOLDINGS.map(function (h) { return Object.assign({}, h); }),
+    phase2: Array.isArray(raw.phase2) && raw.phase2.length
+      ? raw.phase2.map(normalizePhase2)
+      : DEFAULT_PHASE2.map(function (p) { return Object.assign({}, p); }),
+    bilBalance: Math.max(0, toNum(raw.bilBalance, 0)),
+    exchangeRate: toNum(raw.exchangeRate, 1480) > 0 ? toNum(raw.exchangeRate, 1480) : 1480,
+    bilMinPct: Math.max(0, toNum(raw.bilMinPct, 10)),
+    goals: {
+      finalGoalKRW: Math.max(0, toNum(goalsRaw.finalGoalKRW, DEFAULT_GOALS.finalGoalKRW)),
+      dividendGoalKRW: Math.max(0, toNum(goalsRaw.dividendGoalKRW, DEFAULT_GOALS.dividendGoalKRW))
+    },
+    lastPriceSync: typeof raw.lastPriceSync === "string" ? raw.lastPriceSync : null,
+    lastBackupAt: typeof raw.lastBackupAt === "string" ? raw.lastBackupAt : null,
+    lastUpdated: typeof raw.lastUpdated === "string" ? raw.lastUpdated : null
+  };
+}
+
+function serializeState(s) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    holdings: s.holdings,
+    phase2: s.phase2,
+    bilBalance: s.bilBalance,
+    exchangeRate: s.exchangeRate,
+    bilMinPct: s.bilMinPct,
+    goals: s.goals,
+    lastPriceSync: s.lastPriceSync,
+    lastBackupAt: s.lastBackupAt,
+    lastUpdated: new Date().toISOString()
+  };
+}
+
+// v7 키 → 없으면 레거시 키 순서로 탐색. 레거시에서 읽으면 v7로 즉시 복사.
+function loadPersistedState() {
+  try {
+    var raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return { state: normalizeState(JSON.parse(raw)), migrated: false };
+    for (var i = 0; i < LEGACY_STORAGE_KEYS.length; i++) {
+      var legacy = localStorage.getItem(LEGACY_STORAGE_KEYS[i]);
+      if (legacy) {
+        var st = normalizeState(JSON.parse(legacy));
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeState(st))); } catch (e) {}
+        return { state: st, migrated: true };
+      }
+    }
+  } catch (e) {
+    console.warn("저장 데이터 파싱 오류", e);
+  }
+  return null;
+}
+
+// ═══ [4] MARKET API ═════════════════════════════════════════════════
+// 외부 통신은 전부 이 모듈을 통합니다. 새 데이터 소스를 붙일 때도
+// 여기에 api* 함수 하나만 추가하면 UI 쪽 수정이 최소화됩니다.
+
+var __cooldowns = {};
+function underCooldown(key, ms) { return Date.now() - (__cooldowns[key] || 0) < ms; }
+function markCooldown(key) { __cooldowns[key] = Date.now(); }
+function cooldownLeft(key, ms) { return Math.max(1, Math.ceil((ms - (Date.now() - (__cooldowns[key] || 0))) / 1000)); }
+
+async function fetchJson(url) {
+  var res = await fetch(url);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+async function apiQuote(ticker) {
+  var d = await fetchJson(PROXY_URL + "?endpoint=quote&symbol=" + encodeURIComponent(ticker));
+  if (!d || (d.c === 0 && d.h === 0)) throw new Error("no quote");
+  return { price: d.c, dayHigh: d.h || 0 };
+}
+
+// 배당·52주 고가. 실패해도 조용히 빈 값을 돌려서 시세 갱신을 막지 않음
+async function apiMetric(ticker) {
+  try {
+    var d = await fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker));
+    var m = d && d.metric;
+    if (!m) return { div: null, high52: 0 };
+    var div = typeof m.dividendPerShareTTM === "number" ? m.dividendPerShareTTM
+      : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null);
+    var high = typeof m["52WeekHigh"] === "number" ? m["52WeekHigh"] : 0;
+    return { div: (typeof div === "number" && div >= 0) ? div : null, high52: high };
+  } catch (e) {
+    return { div: null, high52: 0 };
+  }
+}
+
+async function apiSearch(q) {
+  var d = await fetchJson(PROXY_URL + "?endpoint=search&q=" + encodeURIComponent(q));
+  var all = (d && d.result) || [];
+  // 해외 교차상장(BRK.A 형태 제외한 "TSLA.MX" 등) 노이즈를 걸러 검색 품질 개선
+  var filtered = all.filter(function (s) { return s.symbol && s.symbol.indexOf(".") === -1; });
+  return (filtered.length ? filtered : all).slice(0, 6);
+}
+
+// 여러 코인을 쉼표로 묶어 한 번에 조회 → { BTC: 66509, ... }
+async function apiCryptoPrices(tickers) {
+  var ids = [];
+  tickers.forEach(function (t) {
+    var id = CRYPTO_IDS[t];
+    if (id && ids.indexOf(id) === -1) ids.push(id);
+  });
+  if (!ids.length) return {};
+  var d = await fetchJson(COINGECKO_URL + "?ids=" + ids.join(",") + "&vs_currencies=usd");
+  var out = {};
+  tickers.forEach(function (t) {
+    var id = CRYPTO_IDS[t];
+    if (id && d[id] && typeof d[id].usd === "number") out[t] = d[id].usd;
+  });
+  return out;
+}
+
+async function apiFxKRW() {
+  var d = await fetchJson(FX_URL);
+  if (d && d.rates && typeof d.rates.KRW === "number") return Number(d.rates.KRW.toFixed(2));
+  throw new Error("no fx");
+}
+
+// ═══ [5] CALC ═══════════════════════════════════════════════════════
+// 화면과 무관한 순수 계산. 새 지표가 필요하면 computeSummary에만 추가.
+
+function calcYield(a) { return (!a.avgPrice || a.qty <= 0) ? 0 : ((a.price - a.avgPrice) / a.avgPrice) * 100; }
+function calcProfit(a) { return (!a.avgPrice || a.qty <= 0) ? 0 : (a.price - a.avgPrice) * a.qty; }
+function dropPct(a) { return (!a.high52 || a.high52 <= 0) ? 0 : ((a.price - a.high52) / a.high52) * 100; }
+
+// 트리거는 음수(하락률)일 때만 무장. 0은 미사용으로 취급해
+// "양수 트리거가 항상 발동되던" 논리 구멍을 차단.
+function statusOf(h) {
+  if ((h.targetQty || 0) > 0 && h.qty >= h.targetQty) return "done";
+  var d = dropPct(h);
+  if (typeof h.t2 === "number" && h.t2 < 0 && d <= h.t2) return "t2";
+  if (typeof h.t1 === "number" && h.t1 < 0 && d <= h.t1) return "t1";
+  return "normal";
+}
+
+// 시세 응답을 자산에 반영하는 유일한 통로 (개별/일괄/1·2단계 공용)
+// 52주 고가는 현재가·당일고가·메트릭 52주고가 중 최댓값으로만 상향(ratchet)
+function applyQuoteToAsset(a, q) {
+  var next = Object.assign({}, a, { price: q.price });
+  next.high52 = Math.max(toNum(a.high52, 0), q.price, toNum(q.dayHigh, 0), toNum(q.metricHigh, 0));
+  if (q.div != null) next.divPerShare = q.div;
+  return next;
+}
+
+// 화면에 필요한 모든 파생 수치를 한 번에 계산하는 순수 함수.
+// App은 이 결과를 각 패널에 내려주기만 합니다.
+function computeSummary(s) {
+  var holdings = s.holdings, phase2 = s.phase2, bilBalance = s.bilBalance;
+  var exchangeRate = s.exchangeRate, bilMinPct = s.bilMinPct, goals = s.goals;
+
+  var phase1TargetUSD = holdings.reduce(function (sum, h) { return sum + (h.targetQty || 0) * h.price; }, 0);
+  var phase1CurrentUSD = holdings.reduce(function (sum, h) { return sum + h.qty * h.price; }, 0);
+  var phase1Progress = phase1TargetUSD > 0 ? Math.min(100, (phase1CurrentUSD / phase1TargetUSD) * 100) : 0;
+  var phase1Done = phase1TargetUSD > 0 && phase1CurrentUSD >= phase1TargetUSD;
+
+  var phase2ValueUSD = phase2.reduce(function (sum, p) { return sum + p.qty * p.price; }, 0);
+  var phase2InvestedUSD = phase2.reduce(function (sum, p) { return sum + p.qty * (p.avgPrice || 0); }, 0);
+  var phase2ProfitUSD = phase2ValueUSD - phase2InvestedUSD;
+
+  var annualDividendUSD =
+    holdings.reduce(function (sum, h) { return sum + h.qty * (h.divPerShare || 0); }, 0) +
+    phase2.reduce(function (sum, p) { return sum + p.qty * (p.divPerShare || 0); }, 0);
+  var annualDividendKRW = annualDividendUSD * exchangeRate;
+  var dividendProgress = goals.dividendGoalKRW > 0 ? Math.min(100, (annualDividendKRW / goals.dividendGoalKRW) * 100) : 0;
+  var dividendGoalReached = goals.dividendGoalKRW > 0 && annualDividendKRW >= goals.dividendGoalKRW;
+
+  var phase1InvestedUSD = holdings.reduce(function (sum, h) { return sum + h.qty * (h.avgPrice || 0); }, 0);
+  var phase1ProfitUSD = phase1CurrentUSD - phase1InvestedUSD;
+  var totalInvestedUSD = phase1InvestedUSD + phase2InvestedUSD;
+  var totalValueUSD = phase1CurrentUSD + phase2ValueUSD + bilBalance;
+  var bilPctOfTotal = totalValueUSD > 0 ? (bilBalance / totalValueUSD) * 100 : 0;
+  var bilLow = totalValueUSD > 0 && bilPctOfTotal < bilMinPct;
+  var totalValueKRW = totalValueUSD * exchangeRate;
+  var totalProfitUSD = phase1ProfitUSD + phase2ProfitUSD;
+  var totalYieldPct = totalInvestedUSD > 0 ? (totalProfitUSD / totalInvestedUSD) * 100 : 0;
+
+  var phase1KRW = phase1CurrentUSD * exchangeRate;
+  var phase2KRW = phase2ValueUSD * exchangeRate;
+  var cashKRW = bilBalance * exchangeRate;
+  var combinedKRW = phase1KRW + phase2KRW + cashKRW;
+  var finalProgress = goals.finalGoalKRW > 0 ? Math.min(100, (combinedKRW / goals.finalGoalKRW) * 100) : 0;
+  var seg1 = goals.finalGoalKRW > 0 ? Math.min(100, (phase1KRW / goals.finalGoalKRW) * 100) : 0;
+  var seg2 = goals.finalGoalKRW > 0 ? Math.min(100 - seg1, (phase2KRW / goals.finalGoalKRW) * 100) : 0;
+  var seg3 = goals.finalGoalKRW > 0 ? Math.min(100 - seg1 - seg2, (cashKRW / goals.finalGoalKRW) * 100) : 0;
+
+  var coreValueUSD = 0, satelliteValueUSD = 0;
+  holdings.forEach(function (h) {
+    if (h.category === "core") coreValueUSD += h.qty * h.price;
+    else satelliteValueUSD += h.qty * h.price;
+  });
+  var totalForBar = coreValueUSD + satelliteValueUSD + phase2ValueUSD + bilBalance || 1;
+  var corePct = (coreValueUSD / totalForBar) * 100;
+  var satellitePct = (satelliteValueUSD / totalForBar) * 100;
+  var phase2Pct = (phase2ValueUSD / totalForBar) * 100;
+  var cashPct = (bilBalance / totalForBar) * 100;
+
+  // 종목별 포트폴리오 비중 (%)
+  var weights = {};
+  var wBase = totalValueUSD > 0 ? totalValueUSD : 1;
+  holdings.forEach(function (h) { weights[h.id] = (h.qty * h.price / wBase) * 100; });
+  phase2.forEach(function (p) { weights[p.id] = (p.qty * p.price / wBase) * 100; });
+  weights.bil = (bilBalance / wBase) * 100;
+
+  var actionItems = holdings
+    .map(function (h) { return { h: h, status: statusOf(h), drop: dropPct(h) }; })
+    .filter(function (x) { return x.status === "t1" || x.status === "t2"; })
+    .sort(function (a, b) { return a.drop - b.drop; });
+  var triggeredCount = actionItems.length;
+  var currentPhaseIdx = dividendGoalReached ? 2 : (phase1Done ? 1 : 0);
+  var isEmpty = phase1CurrentUSD === 0 && phase2ValueUSD === 0;
+
+  return {
+    exchangeRate: exchangeRate,
+    phase1Progress: phase1Progress, phase1Done: phase1Done, phase1CurrentUSD: phase1CurrentUSD,
+    phase2ValueUSD: phase2ValueUSD, phase2ProfitUSD: phase2ProfitUSD,
+    annualDividendKRW: annualDividendKRW, dividendProgress: dividendProgress, dividendGoalReached: dividendGoalReached,
+    totalInvestedUSD: totalInvestedUSD, totalValueUSD: totalValueUSD, totalValueKRW: totalValueKRW,
+    totalProfitUSD: totalProfitUSD, totalYieldPct: totalYieldPct,
+    phase1KRW: phase1KRW, phase2KRW: phase2KRW, cashKRW: cashKRW,
+    finalProgress: finalProgress, seg1: seg1, seg2: seg2, seg3: seg3,
+    coreValueUSD: coreValueUSD, satelliteValueUSD: satelliteValueUSD,
+    corePct: corePct, satellitePct: satellitePct, phase2Pct: phase2Pct, cashPct: cashPct,
+    bilPctOfTotal: bilPctOfTotal, bilLow: bilLow,
+    actionItems: actionItems, triggeredCount: triggeredCount,
+    currentPhaseIdx: currentPhaseIdx, weights: weights, isEmpty: isEmpty
+  };
+}
+
+// ═══ [6] 공용 UI ═════════════════════════════════════════════════════
 
 const IconBase = ({ size = 16, color = "currentColor", children, className = "", style = {} }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} style={style}>{children}</svg>
@@ -80,824 +471,85 @@ const X = (p) => <IconBase {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1=
 const AlertTriangle = (p) => <IconBase {...p}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></IconBase>;
 const RefreshCw = (p) => <IconBase {...p}><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></IconBase>;
 
-const { useState, useEffect, useRef, useCallback } = React;
-
-const DEFAULT_HOLDINGS = [
-  { id: "h1", ticker: "TSLA", name: "테슬라", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 400, high52: 463, targetQty: 100, t1: -25, t2: -40, mdd: -74, divPerShare: 0 },
-  { id: "h2", ticker: "SMH", name: "SMH", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 600, high52: 672, targetQty: 40, t1: -15, t2: -25, mdd: -56, divPerShare: 0 },
-  { id: "h3", ticker: "DRAM", name: "Roundhill Memory", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 58.85, high52: 81.34, targetQty: 200, t1: -15, t2: -25, mdd: -30, divPerShare: 0 },
-  { id: "h4", ticker: "GOOGL", name: "구글", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 359.91, high52: 400, targetQty: 30, t1: -10, t2: -20, mdd: -45, divPerShare: 0 },
-  { id: "h5", ticker: "NVDA", name: "엔비디아", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 194.83, high52: 213, targetQty: 50, t1: -20, t2: -35, mdd: -65, divPerShare: 0 },
-  { id: "h6", ticker: "PLTR", name: "팔란티어", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 134.44, high52: 207.52, targetQty: 100, t1: -25, t2: -40, mdd: -85, divPerShare: 0 },
-  { id: "h7", ticker: "QTUM", name: "퀀텀 ETF", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 144.17, high52: 170, targetQty: 100, t1: -15, t2: -25, mdd: -40, divPerShare: 0 },
-  { id: "h8", ticker: "SPCX", name: "스페이스X", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 120, high52: 225.64, targetQty: 200, t1: -20, t2: -40, mdd: -50, divPerShare: 0 },
-  { id: "h9", ticker: "BTC", name: "비트코인", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 66509, high52: 124000, targetQty: 1, t1: -25, t2: -40, mdd: -84, divPerShare: 0 },
-  { id: "h10", ticker: "ETH", name: "이더리움", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 1928.62, high52: 4000, targetQty: 5, t1: -30, t2: -50, mdd: -94, divPerShare: 0 },
-];
-
-const DEFAULT_PHASE2 = [
-  { id: "p1", ticker: "SCHD", name: "SCHD (배당 코어)", qty: 0, avgPrice: 0, price: 32.92, high52: 33.50, divPerShare: 1.05 },
-  { id: "p2", ticker: "SCHG", name: "SCHG (성장 코어)", qty: 0, avgPrice: 0, price: 34.27, high52: 35.42, divPerShare: 0.12 },
-];
-
-const DIVIDEND_GOAL_KRW = 80000000;
-const FINAL_GOAL_KRW = 2000000000;
-
-function uid() { return "h" + Math.random().toString(36).slice(2, 9); }
-function fmtUSD(n) { return !isFinite(n) ? "$0" : "$" + Math.round(n).toLocaleString("en-US"); }
-function fmtKRWShort(n) {
-  if (!isFinite(n)) return "0원";
-  const sign = n < 0 ? "-" : "";
-  const abs = Math.abs(n);
-  if (abs >= 100000000) {
-    const v = abs / 100000000;
-    return sign + (Number.isInteger(v * 10) ? v.toFixed(1) : v.toFixed(2)).replace(/\.0$/, "") + "억원";
+// 2단계 확인 액션 훅: 첫 탭은 "무장", 일정 시간 안에 한 번 더 탭해야 실행.
+// 삭제·초기화처럼 되돌리기 어려운 동작을 실수 한 번으로부터 보호합니다.
+function useArmed(ms) {
+  const [armed, setArmed] = useState(false);
+  const timer = useRef(null);
+  useEffect(function () {
+    return function () { if (timer.current) clearTimeout(timer.current); };
+  }, []);
+  function fire(cb) {
+    if (!armed) {
+      setArmed(true);
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(function () { setArmed(false); }, ms || 2500);
+      return false;
+    }
+    if (timer.current) clearTimeout(timer.current);
+    setArmed(false);
+    cb();
+    return true;
   }
-  if (abs >= 10000) {
-    return sign + Math.round(abs / 10000).toLocaleString("ko-KR") + "만원";
-  }
-  return sign + Math.round(abs).toLocaleString("ko-KR") + "원";
+  return [armed, fire];
 }
 
-function PortfolioConsole() {
-  const [holdings, setHoldings] = useState(DEFAULT_HOLDINGS);
-  const [phase2, setPhase2] = useState(DEFAULT_PHASE2);
-  const [bilBalance, setBilBalance] = useState(0);
-  const [exchangeRate, setExchangeRate] = useState(1480);
+function ToastHost({ toasts, onClose }) {
+  const COLORS = { success: "#3DDC97", info: "#4FD1C5", warn: "#FFB020", error: "#FF5C5C" };
+  return (
+    <div style={{ position: "fixed", left: 0, right: 0, bottom: "calc(env(safe-area-inset-bottom, 0px) + 16px)", zIndex: 60, display: "flex", flexDirection: "column", alignItems: "center", gap: 8, pointerEvents: "none" }}>
+      {toasts.map((t) => (
+        <div key={t.id} className="toast-item" style={{ pointerEvents: "auto", background: "#161C22", border: "1px solid " + (COLORS[t.type] || "#1F262D"), color: "#E8ECEF", borderRadius: 8, padding: "10px 12px", fontSize: 12, maxWidth: "88%", display: "flex", alignItems: "center", gap: 8, boxShadow: "0 6px 20px rgba(0,0,0,0.45)" }}>
+          <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: COLORS[t.type] || "#8B96A5" }} />
+          <span style={{ wordBreak: "break-all" }}>{t.msg}</span>
+          <button onClick={() => onClose(t.id)} aria-label="알림 닫기" style={{ flexShrink: 0, opacity: 0.7 }}><X size={13} color="#8B96A5" /></button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
-  const [loaded, setLoaded] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showRules, setShowRules] = useState(true);
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [lastSaved, setLastSaved] = useState(null);
-  const [saveError, setSaveError] = useState(false);
-  const [fetchingId, setFetchingId] = useState(null);
-  const [fetchError, setFetchError] = useState(null);
-  const [cooldowns, setCooldowns] = useState({});
-  const [isUpdatingRate, setIsUpdatingRate] = useState(false);
-  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
-  const [hasRefreshedThisSession, setHasRefreshedThisSession] = useState(false);
-  const bulkCooldownRef = useRef(0);
-  const [bilMinPct, setBilMinPct] = useState(10);
-  const [expandedIds, setExpandedIds] = useState({});
-  const saveTimer = useRef(null);
-  const cardRefs = useRef({});
-  const bilCardRef = useRef(null);
-
-  const STORAGE_KEY = "portfolio-data-v6";
-
-  // 🛡️ 보완 2: 데이터 마이그레이션 안전장치 반영
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const data = JSON.parse(saved);
-        if (Array.isArray(data.holdings)) {
-          const migratedHoldings = data.holdings.map(h => ({
-            category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 0, high52: 0, targetQty: 0, t1: -15, t2: -30, mdd: 0, divPerShare: 0, ...h
-          }));
-          setHoldings(migratedHoldings);
-        }
-        if (Array.isArray(data.phase2)) {
-          const migratedPhase2 = data.phase2.map(p => ({
-            qty: 0, avgPrice: 0, price: 0, high52: 0, divPerShare: 0, ...p
-          }));
-          setPhase2(migratedPhase2);
-        }
-        if (typeof data.bilBalance === "number") setBilBalance(data.bilBalance);
-        if (typeof data.exchangeRate === "number") setExchangeRate(data.exchangeRate);
-        if (typeof data.bilMinPct === "number") setBilMinPct(data.bilMinPct);
-        if (data.lastUpdated) setLastSaved(data.lastUpdated);
-      }
-    } catch (e) {
-      console.warn("데이터 파싱 오류");
-    } finally {
-      setLoaded(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!loaded) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => {
-      const payload = { holdings, phase2, bilBalance, exchangeRate, bilMinPct, lastUpdated: new Date().toISOString() };
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-        setSaveError(false);
-        setLastSaved(payload.lastUpdated);
-      } catch (e) {
-        setSaveError(true);
-      }
-    }, 700);
-    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, loaded]);
-
-  function updateHolding(id, field, value) { setHoldings((prev) => prev.map((h) => (h.id === id ? { ...h, [field]: value } : h))); }
-  function removeHolding(id) { setHoldings((prev) => prev.filter((h) => h.id !== id)); }
-  function addHolding(nh) { setHoldings((prev) => [...prev, { ...nh, id: uid() }]); setShowAddForm(false); }
-  function updatePrice(id, newPrice) {
-    setHoldings((prev) => prev.map((h) => (h.id !== id ? h : { ...h, price: newPrice, high52: Math.max(newPrice, h.high52) })));
+// 숫자 입력 필드 (전면 재작성)
+// - 기존 parseFloat||0 방식은 "0.5"의 소수점, "-15"의 마이너스 입력이 불가능했음
+// - 입력 중에는 문자열 상태를 유지하고, 유효한 숫자만 상위로 전달
+// - negative 모드: 트리거처럼 항상 음수인 값은 "-" 접두를 고정 표시하고
+//   사용자는 크기만 입력 → 아이폰 숫자 키패드(마이너스 없음)로도 입력 가능
+function Field({ label, value, onChange, negative, hint }) {
+  function numToText(v) {
+    var n = (typeof v === "number" && isFinite(v)) ? v : 0;
+    return String(negative ? Math.abs(n) : n);
   }
-  function updatePhase2(id, field, value) { setPhase2((prev) => prev.map((p) => (p.id === id ? { ...p, [field]: value } : p))); }
-  function toggleExpand(id) { setExpandedIds((prev) => ({ ...prev, [id]: !prev[id] })); }
-  function jumpToHolding(id) {
-    setExpandedIds((prev) => ({ ...prev, [id]: true }));
-    setTimeout(() => {
-      const el = cardRefs.current[id];
-      if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 50);
+  const [text, setText] = useState(numToText(value));
+  const focused = useRef(false);
+  useEffect(function () {
+    if (!focused.current) setText(numToText(value));
+  }, [value, negative]);
+
+  function handleChange(e) {
+    var raw = e.target.value.replace(/[^0-9.]/g, "");
+    var firstDot = raw.indexOf(".");
+    if (firstDot !== -1) raw = raw.slice(0, firstDot + 1) + raw.slice(firstDot + 1).replace(/\./g, "");
+    setText(raw);
+    if (raw === "" || raw === ".") { onChange(0); return; }
+    var n = parseFloat(raw);
+    if (isFinite(n)) onChange(negative ? -n : n);
   }
-  function jumpToBil() {
-    if (bilCardRef.current) bilCardRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
-  }
-
-  // 🛡️ 보완 3: JSON 데이터 백업/복원 기능
-  function handleExportData() {
-    const dataStr = localStorage.getItem(STORAGE_KEY);
-    if (!dataStr) {
-      alert("백업할 데이터가 없습니다.");
-      return;
-    }
-    const blob = new Blob([dataStr], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `portfolio_backup_${new Date().toISOString().split("T")[0]}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  function handleImportData(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const data = JSON.parse(evt.target.result);
-        if (data && Array.isArray(data.holdings)) {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-          alert("데이터 복원이 완료되었습니다. 앱을 새로고침합니다.");
-          window.location.reload();
-        } else {
-          alert("유효하지 않은 백업 파일 형식입니다.");
-        }
-      } catch (err) {
-        alert("파일 읽기 오류가 발생했습니다.");
-      }
-    };
-    reader.readAsText(file);
-  }
-
-  const CRYPTO_IDS = { BTC: "bitcoin", ETH: "ethereum" };
-  
-  async function fetchCryptoLive(h) {
-    const coinId = CRYPTO_IDS[h.ticker];
-    if (!coinId) return;
-    if (Date.now() - (cooldowns[h.ticker] || 0) < 30000) {
-      setFetchError(`${h.ticker} 조회는 잠시 후 다시 시도해줘.`); return;
-    }
-    setFetchingId(h.id); setFetchError(null);
-    try {
-      const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`);
-      if (!res.ok) throw new Error("fetch failed");
-      const data = await res.json();
-      const currentPrice = data[coinId].usd;
-      if (!currentPrice) throw new Error("no data");
-      setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price: currentPrice, high52: Math.max(currentPrice, x.high52) } : x)));
-      setCooldowns((prev) => ({ ...prev, [h.ticker]: Date.now() }));
-    } catch (e) { setFetchError(`${h.ticker} 코인 조회 실패 - 수동 입력 필요`); }
-    finally { setFetchingId(null); }
-  }
-
-  async function fetchDividendPerShare(ticker) {
-    try {
-      const res = await fetch(`${PROXY_URL}?endpoint=metric&symbol=${ticker}`);
-      if (!res.ok) return null;
-      const data = await res.json();
-      const m = data && data.metric;
-      if (!m) return null;
-      const val = (typeof m.dividendPerShareTTM === "number" ? m.dividendPerShareTTM : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null));
-      return (typeof val === "number" && val >= 0) ? val : null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  async function fetchStockLive(ticker, applyFn) {
-    if (Date.now() - (cooldowns[ticker] || 0) < 10000) {
-      setFetchError(`${ticker} 조회 쿨타임(10초)입니다.`); return;
-    }
-    setFetchingId(ticker); setFetchError(null);
-    try {
-      const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${ticker}`);
-      if (!res.ok) throw new Error("fetch failed");
-      const data = await res.json();
-      if (data.c === 0 && data.h === 0) throw new Error("invalid ticker");
-      const div = await fetchDividendPerShare(ticker);
-      applyFn(data.c, data.h, div);
-      setCooldowns((prev) => ({ ...prev, [ticker]: Date.now() }));
-    } catch (e) { setFetchError(`${ticker} 조회 실패 - 티커를 확인해줘.`); }
-    finally { setFetchingId(null); }
-  }
-
-  function fetchHoldingLive(h) {
-    if (h.isCrypto) return fetchCryptoLive(h);
-    return fetchStockLive(h.ticker, (price, todayHigh, div) => {
-      setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price, high52: Math.max(price, todayHigh, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-    });
-  }
-
-  function fetchPhase2Live(p) {
-    return fetchStockLive(p.ticker, (price, todayHigh, div) => {
-      setPhase2((prev) => prev.map((x) => (x.id === p.id ? { ...x, price, high52: Math.max(price, todayHigh, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-    });
-  }
-
-  // 🛡️ 보완 1: 코인 시세 일괄 조회 최적화 적용
-  async function refreshAllPrices() {
-    if (Date.now() - bulkCooldownRef.current < 20000) {
-      setFetchError("전체 갱신은 20초 후에 다시 시도해줘.");
-      return;
-    }
-    setIsRefreshingAll(true);
-    setFetchError(null);
-    const failed = [];
-
-    // 코인 일괄 조회 로직 (쉼표로 묶어 한 번에 통신)
-    const cryptoHoldings = holdings.filter((h) => h.isCrypto);
-    if (cryptoHoldings.length > 0) {
-      const coinIds = [...new Set(cryptoHoldings.map((h) => CRYPTO_IDS[h.ticker]).filter(Boolean))];
-      if (coinIds.length > 0) {
-        try {
-          const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${coinIds.join(",")}&vs_currencies=usd`);
-          if (!res.ok) throw new Error();
-          const data = await res.json();
-          setHoldings((prev) => prev.map((x) => {
-            if (!x.isCrypto) return x;
-            const cid = CRYPTO_IDS[x.ticker];
-            if (cid && data[cid] && data[cid].usd) {
-              return { ...x, price: data[cid].usd, high52: Math.max(data[cid].usd, x.high52) };
-            }
-            return x;
-          }));
-        } catch (e) {
-          failed.push("코인(일괄)");
-        }
-      }
-    }
-
-    // 주식 개별 조회 로직
-    for (const h of holdings.filter((h) => !h.isCrypto)) {
-      try {
-        const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${h.ticker}`);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        if (data.c === 0 && data.h === 0) throw new Error();
-        const div = await fetchDividendPerShare(h.ticker);
-        setHoldings((prev) => prev.map((x) => (x.id === h.id ? { ...x, price: data.c, high52: Math.max(data.c, data.h, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-      } catch (e) {
-        failed.push(h.ticker);
-      }
-      await new Promise((r) => setTimeout(r, 300));
-    }
-
-    for (const p of phase2) {
-      try {
-        const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${p.ticker}`);
-        if (!res.ok) throw new Error();
-        const data = await res.json();
-        if (data.c === 0 && data.h === 0) throw new Error();
-        const div = await fetchDividendPerShare(p.ticker);
-        setPhase2((prev) => prev.map((x) => (x.id === p.id ? { ...x, price: data.c, high52: Math.max(data.c, data.h, x.high52), divPerShare: (div != null ? div : x.divPerShare) } : x)));
-      } catch (e) {
-        failed.push(p.ticker);
-      }
-      await new Promise((r) => setTimeout(r, 300));
-    }
-
-    bulkCooldownRef.current = Date.now();
-    setIsRefreshingAll(false);
-    setHasRefreshedThisSession(true);
-    if (failed.length > 0) setFetchError(`일부 조회 실패: ${failed.join(", ")}`);
-  }
-
-  const fetchLiveExchangeRate = useCallback(async () => {
-    setIsUpdatingRate(true);
-    try {
-      const res = await fetch("https://open.er-api.com/v6/latest/USD");
-      const data = await res.json();
-      if (data && data.rates && data.rates.KRW) setExchangeRate(Number(data.rates.KRW.toFixed(2)));
-    } catch (e) { setFetchError("환율 자동 조회 실패"); }
-    finally { setIsUpdatingRate(false); }
-  }, []);
-
-  function calcYield(h) { return (!h.avgPrice || h.qty <= 0) ? 0 : ((h.price - h.avgPrice) / h.avgPrice) * 100; }
-  function calcProfit(h) { return (!h.avgPrice || h.qty <= 0) ? 0 : (h.price - h.avgPrice) * h.qty; }
-  function dropPct(h) { return (!h.high52 || h.high52 <= 0) ? 0 : ((h.price - h.high52) / h.high52) * 100; }
-
-  function statusOf(h) {
-    if ((h.targetQty || 0) > 0 && h.qty >= h.targetQty) return "done";
-    const d = dropPct(h);
-    if (typeof h.t2 === "number" && d <= h.t2) return "t2";
-    if (typeof h.t1 === "number" && d <= h.t1) return "t1";
-    return "normal";
-  }
-
-  const CASH_COLOR = "#3B82F6";
-  const STATUS_META = { normal: { label: "정상", color: "#3DDC97" }, t1: { label: "2배 매수", color: "#FFB020" }, t2: { label: "BIL 집행", color: "#FF5C5C" }, done: { label: "목표 달성", color: "#60A5FA" } };
-
-  const phase1TargetUSD = holdings.reduce((sum, h) => sum + (h.targetQty || 0) * h.price, 0);
-  const phase1CurrentUSD = holdings.reduce((sum, h) => sum + h.qty * h.price, 0);
-  const phase1Progress = phase1TargetUSD > 0 ? Math.min(100, (phase1CurrentUSD / phase1TargetUSD) * 100) : 0;
-  const phase1Done = phase1TargetUSD > 0 && phase1CurrentUSD >= phase1TargetUSD;
-
-  const phase2ValueUSD = phase2.reduce((sum, p) => sum + p.qty * p.price, 0);
-  const phase2InvestedUSD = phase2.reduce((sum, p) => sum + p.qty * (p.avgPrice || 0), 0);
-  const phase2ProfitUSD = phase2ValueUSD - phase2InvestedUSD;
-
-  const annualDividendUSD =
-    holdings.reduce((sum, h) => sum + h.qty * (h.divPerShare || 0), 0) +
-    phase2.reduce((sum, p) => sum + p.qty * (p.divPerShare || 0), 0);
-  const annualDividendKRW = annualDividendUSD * exchangeRate;
-  const dividendProgress = Math.min(100, (annualDividendKRW / DIVIDEND_GOAL_KRW) * 100);
-  const dividendGoalReached = annualDividendKRW >= DIVIDEND_GOAL_KRW;
-
-  const phase1InvestedUSD = holdings.reduce((sum, h) => sum + h.qty * (h.avgPrice || 0), 0);
-  const phase1ProfitUSD = phase1CurrentUSD - phase1InvestedUSD;
-  const totalInvestedUSD = phase1InvestedUSD + phase2InvestedUSD;
-  const holdingsValueUSD = phase1CurrentUSD;
-  const totalValueUSD = holdingsValueUSD + phase2ValueUSD + bilBalance;
-  const bilPctOfTotal = totalValueUSD > 0 ? (bilBalance / totalValueUSD) * 100 : 0;
-  const bilLow = totalValueUSD > 0 && bilPctOfTotal < bilMinPct;
-  const totalValueKRW = totalValueUSD * exchangeRate;
-  const totalProfitUSD = phase1ProfitUSD + phase2ProfitUSD;
-  const totalYieldPct = totalInvestedUSD > 0 ? (totalProfitUSD / totalInvestedUSD) * 100 : 0;
-
-  const phase1KRW = phase1CurrentUSD * exchangeRate;
-  const phase2KRW = phase2ValueUSD * exchangeRate;
-  const cashKRW = bilBalance * exchangeRate;
-  const combinedKRW = phase1KRW + phase2KRW + cashKRW;
-  const finalProgress = Math.min(100, (combinedKRW / FINAL_GOAL_KRW) * 100);
-  const seg1 = Math.min(100, (phase1KRW / FINAL_GOAL_KRW) * 100);
-  const seg2 = Math.min(100 - seg1, (phase2KRW / FINAL_GOAL_KRW) * 100);
-  const seg3 = Math.min(100 - seg1 - seg2, (cashKRW / FINAL_GOAL_KRW) * 100);
-
-  const coreValueUSD = holdings.filter((h) => h.category === "core").reduce((s, h) => s + h.qty * h.price, 0);
-  const satelliteValueUSD = holdings.filter((h) => h.category === "satellite").reduce((s, h) => s + h.qty * h.price, 0);
-  const totalForBar = coreValueUSD + satelliteValueUSD + phase2ValueUSD + bilBalance || 1;
-  const corePct = (coreValueUSD / totalForBar) * 100;
-  const satellitePct = (satelliteValueUSD / totalForBar) * 100;
-  const phase2Pct = (phase2ValueUSD / totalForBar) * 100;
-  const cashPct = (bilBalance / totalForBar) * 100;
-  const triggeredCount = holdings.filter((h) => { const s = statusOf(h); return s === "t1" || s === "t2"; }).length;
-  const currentPhaseIdx = dividendGoalReached ? 2 : (phase1Done ? 1 : 0);
-  const actionItems = holdings
-    .map((h) => ({ h, status: statusOf(h), drop: dropPct(h) }))
-    .filter((x) => x.status === "t1" || x.status === "t2")
-    .sort((a, b) => a.drop - b.drop);
 
   return (
-    <div style={{ fontFamily: "'Noto Sans KR', sans-serif", background: "#0B0E11", minHeight: "100vh", color: "#E8ECEF" }} className="w-full min-h-screen pb-16 relative">
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
-        .mono { font-family: 'JetBrains Mono', monospace; }
-        .panel { background: #12161B; border: 1px solid #1F262D; }
-        .led { box-shadow: 0 0 8px 1px currentColor; }
-        input:focus { outline: 1px solid #4FD1C5; }
-        @keyframes pulseGlow {
-          0%, 100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.45); }
-          50% { box-shadow: 0 0 0 10px rgba(79, 209, 197, 0); }
-        }
-        .pulse-cta { animation: pulseGlow 1.8s ease-in-out infinite; }
-      `}</style>
-
-      <div className="panel" style={{ borderLeft: "none", borderRight: "none", borderTop: "none" }}>
-        <div className="max-w-3xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div>
-            <div className="mono tracking-widest" style={{ color: "#4FD1C5", fontSize: "11px" }}>PF-06 (보안 프록시 연동)</div>
-            <div className="text-lg font-bold">자산 관제 콘솔</div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button onClick={refreshAllPrices} disabled={isRefreshingAll} title="전체 시세 일괄 갱신" className="p-2 rounded-md hover:bg-gray-800 flex items-center gap-1.5" style={{ background: "#1A2027" }}>
-              <RefreshCw size={18} color="#4FD1C5" className={isRefreshingAll ? "animate-spin" : ""} />
-              <span style={{ color: "#4FD1C5", fontSize: "11px" }} className="hidden sm:inline">{isRefreshingAll ? "갱신중" : "전체갱신"}</span>
-            </button>
-            <button onClick={() => setShowSettings(true)} className="p-2 rounded-md hover:bg-gray-800" style={{ background: "#1A2027" }}>
-              <Settings size={18} color="#8B96A5" />
-            </button>
-          </div>
-        </div>
+    <div>
+      <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>{label}</div>
+      <div className="fld flex items-center rounded" style={{ background: "#0B0E11", border: "1px solid #1F262D" }}>
+        {negative && <span className="mono pl-2" style={{ color: "#8B96A5", fontSize: "13px" }}>-</span>}
+        <input
+          type="text" inputMode="decimal" value={text}
+          onFocus={(e) => { focused.current = true; e.target.select(); }}
+          onBlur={() => { focused.current = false; setText(numToText(value)); }}
+          onChange={handleChange}
+          className="mono w-full text-sm px-2 py-1.5"
+          style={{ color: "#E8ECEF", border: "none", background: "transparent" }}
+        />
       </div>
-
-      <div className="max-w-3xl mx-auto px-4 pt-5 space-y-5">
-        {!hasRefreshedThisSession && (
-          <button onClick={refreshAllPrices} disabled={isRefreshingAll} className="w-full rounded-lg p-4 flex items-center justify-center gap-2 pulse-cta"
-            style={{ background: "#132A28", border: "1px solid #4FD1C5" }}>
-            <RefreshCw size={18} color="#4FD1C5" className={isRefreshingAll ? "animate-spin" : ""} />
-            <span style={{ color: "#4FD1C5", fontSize: "13px", fontWeight: "bold" }}>
-              {isRefreshingAll ? "최신 시세 불러오는 중..." : "시작 전, 최신 시세로 한 번 갱신하기"}
-            </span>
-          </button>
-        )}
-
-        {fetchError && (
-          <div className="rounded-lg px-4 py-2 flex items-center justify-between" style={{ background: "#241417", border: "1px solid #4A2126", color: "#FF8A8A", fontSize: "12px" }}>
-            <span>{fetchError}</span>
-            <button onClick={() => setFetchError(null)}><X size={14} color="#FF8A8A" /></button>
-          </div>
-        )}
-
-        <div className="panel rounded-lg overflow-hidden" style={{ border: (actionItems.length > 0 || bilLow) ? "1px solid #4A2126" : "1px solid #1F262D" }}>
-          <div className="p-4 pb-2 flex items-center gap-2">
-            <AlertTriangle size={16} color={(actionItems.length > 0 || bilLow) ? "#FFB020" : "#3DDC97"} />
-            <div className="text-sm font-bold">지금 확인할 항목 {(actionItems.length + (bilLow ? 1 : 0)) > 0 ? `${actionItems.length + (bilLow ? 1 : 0)}건` : ""}</div>
-          </div>
-          {actionItems.length === 0 && !bilLow ? (
-            <div className="px-4 pb-4" style={{ color: "#3DDC97", fontSize: "12px" }}>모든 종목 정상 · 매수 트리거 없음</div>
-          ) : (
-            <div className="px-4 pb-4 flex flex-wrap gap-2">
-              {actionItems.map(({ h, status }) => (
-                <button key={h.id} onClick={() => jumpToHolding(h.id)} className="flex items-center gap-1.5 rounded-full px-3 py-1.5" style={{ background: "#1A2027" }}>
-                  <span className="w-2 h-2 rounded-full led" style={{ background: STATUS_META[status].color, color: STATUS_META[status].color }} />
-                  <span className="mono font-bold text-sm">{h.ticker}</span>
-                </button>
-              ))}
-              {bilLow && (
-                <button onClick={jumpToBil} className="flex items-center gap-1.5 rounded-full px-3 py-1.5" style={{ background: "#1A2027" }}>
-                  <span className="w-2 h-2 rounded-full led" style={{ background: "#FFB020", color: "#FFB020" }} />
-                  <span className="mono font-bold text-sm">BIL</span>
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="panel rounded-lg p-5">
-          <div className="flex items-baseline justify-between flex-wrap gap-2">
-            <div>
-              <div style={{ color: "#8B96A5", fontSize: "12px" }}>총 평가액 (1단계+2단계+현금)</div>
-              <div className="mono text-3xl font-bold">{fmtKRWShort(totalValueKRW)}</div>
-              <div className="flex items-center gap-2 mt-1">
-                <div className="mono" style={{ color: "#8B96A5", fontSize: "12px" }}>{fmtUSD(totalValueUSD)}</div>
-                {totalInvestedUSD > 0 && (
-                  <div className="mono" style={{ color: totalProfitUSD >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
-                    ({totalProfitUSD >= 0 ? "+" : ""}{totalYieldPct.toFixed(1)}%)
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="text-right">
-              <div style={{ color: "#8B96A5", fontSize: "12px" }}>트리거 발동 자산</div>
-              <div className="mono text-2xl font-bold" style={{ color: triggeredCount > 0 ? "#FFB020" : "#3DDC97" }}>{triggeredCount}건</div>
-            </div>
-          </div>
-
-          <div className="mt-5">
-            <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
-              <span>1단계 · 개별 종목·ETF 목표수량 달성률{phase1Done ? " · 완료" : ""}</span>
-              <span className="mono" style={{ color: phase1Done ? "#3DDC97" : "#8B96A5" }}>{phase1Progress.toFixed(1)}%</span>
-            </div>
-            <div className="w-full rounded-full h-2" style={{ background: "#1A2027" }}>
-              <div className="h-2 rounded-full" style={{ width: `${phase1Progress}%`, background: phase1Done ? "#3DDC97" : "#4FD1C5" }} />
-            </div>
-          </div>
-
-          <div className="mt-4">
-            <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
-              <span>2단계 목표 · 20억원 (달성 시 3단계 진입)</span>
-              <span className="mono">{finalProgress.toFixed(2)}%</span>
-            </div>
-            <div className="w-full h-3 rounded-full overflow-hidden flex" style={{ background: "#1A2027" }}>
-              <div style={{ width: `${seg1}%`, background: "#4FD1C5" }} />
-              <div style={{ width: `${seg2}%`, background: "#B18CFF" }} />
-              <div style={{ width: `${seg3}%`, background: CASH_COLOR }} />
-            </div>
-            <div className="flex gap-3 mt-2 flex-wrap" style={{ color: "#8B96A5", fontSize: "11px" }}>
-              <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: "#4FD1C5" }} />1단계 {fmtKRWShort(phase1KRW)}</span>
-              <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: "#B18CFF" }} />2단계(SCHD·SCHG) {fmtKRWShort(phase2KRW)}</span>
-              <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: CASH_COLOR }} />현금(BIL) {fmtKRWShort(cashKRW)}</span>
-            </div>
-          </div>
-
-          <div className="mt-4">
-            <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
-              <span>3단계 최종목표 · 연 배당금(세전) 8,000만원{dividendGoalReached ? " · 달성" : ""}</span>
-              <span className="mono" style={{ color: dividendGoalReached ? "#60A5FA" : "#8B96A5" }}>{fmtKRWShort(annualDividendKRW)}</span>
-            </div>
-            <div className="w-full rounded-full h-2" style={{ background: "#1A2027" }}>
-              <div className="h-2 rounded-full" style={{ width: `${dividendProgress}%`, background: dividendGoalReached ? "#60A5FA" : "#B18CFF" }} />
-            </div>
-            <div className="mt-1" style={{ color: "#5C666F", fontSize: "11px" }}>{dividendProgress.toFixed(1)}% · 세전 기준, 실수령액은 배당소득세 등 공제 후 감소</div>
-          </div>
-
-          <div className="flex mt-5 gap-2">
-            {["성장자산 매집", "SCHD·SCHG 전환", "배당 전환"].map((label, i) => (
-              <div key={label} className="flex-1 text-center">
-                <div className="mono mb-1" style={{ color: i === currentPhaseIdx ? "#4FD1C5" : i < currentPhaseIdx ? "#3DDC97" : "#4A535C", fontSize: "11px" }}>{`0${i + 1}`}</div>
-                <div className="h-1 rounded-full mb-1" style={{ background: i === currentPhaseIdx ? "#4FD1C5" : i < currentPhaseIdx ? "#3DDC97" : "#1F262D" }} />
-                <div style={{ color: i === currentPhaseIdx ? "#E8ECEF" : "#4A535C", fontSize: "11px" }}>{label}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="panel rounded-lg p-5">
-          <div className="mb-3" style={{ color: "#8B96A5", fontSize: "12px" }}>자산 현황</div>
-          <div className="flex items-center gap-5 flex-wrap">
-            <div className="relative flex-shrink-0" style={{ width: 148, height: 148 }}>
-              <DonutChart
-                size={148}
-                strokeWidth={20}
-                segments={[
-                  { value: coreValueUSD * exchangeRate, color: "#4FD1C5" },
-                  { value: satelliteValueUSD * exchangeRate, color: "#FFB020" },
-                  { value: phase2KRW, color: "#B18CFF" },
-                  { value: cashKRW, color: CASH_COLOR },
-                ]}
-              />
-              <div className="absolute inset-0 flex flex-col items-center justify-center">
-                <div className="mono font-bold" style={{ fontSize: "13px" }}>{fmtKRWShort(totalValueKRW)}</div>
-                <div style={{ color: "#5C666F", fontSize: "10px" }}>총 자산</div>
-              </div>
-            </div>
-            <div className="flex-1 min-w-[140px] space-y-1.5" style={{ fontSize: "11px", color: "#8B96A5" }}>
-              <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: "#4FD1C5" }} />1단계 핵심</span><span className="mono">{corePct.toFixed(0)}%</span></div>
-              <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: "#FFB020" }} />1단계 위성</span><span className="mono">{satellitePct.toFixed(0)}%</span></div>
-              <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: "#B18CFF" }} />2단계 SCHD·SCHG</span><span className="mono">{phase2Pct.toFixed(0)}%</span></div>
-              <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: CASH_COLOR }} />현금(BIL)</span><span className="mono">{cashPct.toFixed(0)}%</span></div>
-            </div>
-          </div>
-
-          <div className="mt-5 pt-4 space-y-2" style={{ borderTop: "1px solid #1F262D" }}>
-            {[
-              ...holdings.map((h) => ({ key: h.id, ticker: h.ticker, value: h.qty * h.price, color: h.category === "core" ? "#4FD1C5" : "#FFB020" })),
-              ...phase2.map((p) => ({ key: p.id, ticker: p.ticker, value: p.qty * p.price, color: "#B18CFF" })),
-              { key: "bil", ticker: "BIL", value: bilBalance, color: CASH_COLOR },
-            ]
-              .filter((x) => x.value > 0)
-              .sort((a, b) => b.value - a.value)
-              .map((x, i, arr) => {
-                const maxVal = Math.max(...arr.map((y) => y.value), 1);
-                const widthPct = (x.value / maxVal) * 100;
-                return (
-                  <div key={x.key} className="flex items-center gap-2">
-                    <div className="mono flex-shrink-0" style={{ width: 44, color: "#8B96A5", fontSize: "11px" }}>{x.ticker}</div>
-                    <div className="flex-1 rounded-full h-2" style={{ background: "#1A2027" }}>
-                      <div className="h-2 rounded-full" style={{ width: `${widthPct}%`, background: x.color }} />
-                    </div>
-                    <div className="mono flex-shrink-0 text-right" style={{ width: 72, fontSize: "11px" }}>{fmtUSD(x.value)}</div>
-                  </div>
-                );
-              })}
-          </div>
-        </div>
-
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <div className="text-sm font-bold">1단계 · 보유자산</div>
-            <button onClick={() => setShowAddForm((s) => !s)} className="flex items-center gap-1 px-2 py-1 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "12px" }}>
-              <Plus size={14} /> 추가
-            </button>
-          </div>
-
-          {showAddForm && <AddHoldingForm onAdd={addHolding} onCancel={() => setShowAddForm(false)} />}
-
-          <div className="space-y-2">
-            {holdings.map((h) => {
-              const status = statusOf(h);
-              const meta = STATUS_META[status];
-              const d = dropPct(h);
-              const value = h.qty * h.price;
-              const yld = calcYield(h);
-              const prf = calcProfit(h);
-              const targetQty = h.targetQty || 0;
-              const remainingQty = Math.max(0, targetQty - h.qty);
-              const remainingAmount = remainingQty * h.price;
-              const targetProgress = targetQty > 0 ? Math.min(100, (h.qty / targetQty) * 100) : 0;
-              const expanded = !!expandedIds[h.id];
-
-              return (
-                <div key={h.id} ref={(el) => { cardRefs.current[h.id] = el; }} className="panel rounded-lg overflow-hidden">
-                  <div className="flex items-center justify-between p-4 cursor-pointer" onClick={() => toggleExpand(h.id)}>
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="w-2.5 h-2.5 rounded-full led flex-shrink-0" style={{ background: meta.color, color: meta.color }} />
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="mono font-bold text-sm">{h.ticker}</span>
-                          <span style={{ color: "#8B96A5", fontSize: "12px" }}>{h.name}</span>
-                          {h.isCrypto && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "10px" }}>코인</span>}
-                        </div>
-                        <div className="mt-0.5" style={{ color: meta.color, fontSize: "11px" }}>{meta.label} · {d.toFixed(1)}%</div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-1 flex-shrink-0">
-                      <div className="mono text-sm font-bold mr-1">{fmtUSD(value)}</div>
-                      <button onClick={(e) => { e.stopPropagation(); fetchHoldingLive(h); }} disabled={fetchingId === h.id || fetchingId === h.ticker} className="p-1 hover:bg-gray-800 rounded">
-                        <RefreshCw size={14} color="#4FD1C5" className={(fetchingId === h.id || fetchingId === h.ticker) ? "animate-spin" : ""} />
-                      </button>
-                      <button onClick={(e) => { e.stopPropagation(); removeHolding(h.id); }} className="p-1 hover:bg-gray-800 rounded">
-                        <Trash2 size={14} color="#4A535C" />
-                      </button>
-                      {expanded ? <ChevronUp size={16} color="#8B96A5" /> : <ChevronDown size={16} color="#8B96A5" />}
-                    </div>
-                  </div>
-
-                  {expanded && (
-                    <div className="px-4 pb-4" style={{ borderTop: "1px solid #1F262D" }}>
-                      <div className="grid grid-cols-3 gap-2 mt-3">
-                        <Field label="수량" value={h.qty} onChange={(v) => updateHolding(h.id, "qty", v)} />
-                        <Field label="평단가($)" value={h.avgPrice || 0} onChange={(v) => updateHolding(h.id, "avgPrice", v)} />
-                        <Field label="현재가($)" value={h.price} onChange={(v) => updatePrice(h.id, v)} />
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 mt-2">
-                        <Field label="52주 고가($)" value={h.high52} onChange={(v) => updateHolding(h.id, "high52", v)} />
-                        <Field label="목표수량(주/개)" value={h.targetQty || 0} onChange={(v) => updateHolding(h.id, "targetQty", v)} />
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-2 mt-2 pt-2" style={{ borderTop: "1px dashed #1F262D" }}>
-                        <Field label="1차 트리거(%)" value={h.t1 || 0} onChange={(v) => updateHolding(h.id, "t1", v)} />
-                        <Field label="2차 트리거(%)" value={h.t2 || 0} onChange={(v) => updateHolding(h.id, "t2", v)} />
-                        <Field label="과거 MDD(%)" value={h.mdd || 0} onChange={(v) => updateHolding(h.id, "mdd", v)} />
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2 mt-2">
-                        <Field label="연배당($/주)" value={h.divPerShare || 0} onChange={(v) => updateHolding(h.id, "divPerShare", v)} />
-                        <div>
-                          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
-                          <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(h.qty * (h.divPerShare || 0))}</div>
-                        </div>
-                      </div>
-
-                      <div className="flex justify-between items-center mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="mono" style={{ color: d <= 0 ? "#FF5C5C" : "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>현재하락 {d.toFixed(1)}%</span>
-                            <span className="mono" style={{ color: "#5C666F", fontSize: "10px" }}>(최악기준 {h.mdd || 0}%)</span>
-                          </div>
-                          {h.qty > 0 && h.avgPrice > 0 && (
-                            <div className="mono mt-0.5" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
-                              수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {targetQty > 0 && (
-                        <div className="mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
-                          <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "11px" }}>
-                            <span>수량 달성률 (목표 {targetQty}주)</span>
-                            <span className="mono">{targetProgress.toFixed(0)}%</span>
-                          </div>
-                          <div className="w-full rounded-full h-1.5 mb-1.5" style={{ background: "#1A2027" }}>
-                            <div className="h-1.5 rounded-full" style={{ width: `${targetProgress}%`, background: remainingQty <= 0 ? "#3DDC97" : "#4FD1C5" }} />
-                          </div>
-                          <div className="mono" style={{ color: remainingQty <= 0 ? "#3DDC97" : "#B8C1CA", fontSize: "12px" }}>
-                            {remainingQty <= 0 ? "✅ 수량 목표 달성!" : `목표까지 ${remainingQty}주 남음 (약 ${fmtUSD(remainingAmount)} 필요)`}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <div className="text-sm font-bold">2단계 · SCHD·SCHG (배당·성장 코어)</div>
-            <div style={{ color: "#8B96A5", fontSize: "11px" }}>{fmtUSD(phase2ValueUSD)}</div>
-          </div>
-          <div className="space-y-2">
-            {phase2.map((p) => {
-              const value = p.qty * p.price;
-              const d = dropPct(p);
-              const yld = (!p.avgPrice || p.qty <= 0) ? 0 : ((p.price - p.avgPrice) / p.avgPrice) * 100;
-              const prf = (!p.avgPrice || p.qty <= 0) ? 0 : (p.price - p.avgPrice) * p.qty;
-              return (
-                <div key={p.id} className="panel rounded-lg p-4">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="mono font-bold text-sm">{p.ticker}</span>
-                        <span style={{ color: "#8B96A5", fontSize: "12px" }}>{p.name}</span>
-                      </div>
-                      <div style={{ color: "#8B96A5", fontSize: "11px" }} className="mt-0.5">고점대비 {d.toFixed(1)}%</div>
-                    </div>
-                    <button onClick={() => fetchPhase2Live(p)} disabled={fetchingId === p.ticker} className="p-1 hover:bg-gray-800 rounded">
-                      <RefreshCw size={14} color="#4FD1C5" className={fetchingId === p.ticker ? "animate-spin" : ""} />
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 mt-3">
-                    <Field label="수량" value={p.qty} onChange={(v) => updatePhase2(p.id, "qty", v)} />
-                    <Field label="평단가($)" value={p.avgPrice || 0} onChange={(v) => updatePhase2(p.id, "avgPrice", v)} />
-                    <Field label="현재가($)" value={p.price} onChange={(v) => updatePhase2(p.id, "price", v)} />
-                  </div>
-                  <div className="grid grid-cols-2 gap-2 mt-2">
-                    <Field label="연배당($/주)" value={p.divPerShare || 0} onChange={(v) => updatePhase2(p.id, "divPerShare", v)} />
-                    <div>
-                      <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
-                      <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(p.qty * (p.divPerShare || 0))}</div>
-                    </div>
-                  </div>
-                  <div className="flex justify-between items-center mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
-                    <div>
-                      {p.qty > 0 && p.avgPrice > 0 && (
-                        <div className="mono" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
-                          수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
-                        </div>
-                      )}
-                    </div>
-                    <div className="mono text-sm font-bold">{fmtUSD(value)}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        <div ref={bilCardRef} className="panel rounded-lg p-4" style={{ border: bilLow ? "1px solid #4A3B1F" : "1px solid #1F262D" }}>
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-bold">대기자금 (BIL)</div>
-              <div style={{ color: bilLow ? "#FFB020" : "#8B96A5", fontSize: "11px" }}>
-                {bilLow ? `⚠ 전체자산 대비 ${bilPctOfTotal.toFixed(1)}% (최소 ${bilMinPct}% 권장)` : `전체자산 대비 ${bilPctOfTotal.toFixed(1)}% · 트리거 집행 실탄`}
-              </div>
-            </div>
-            <div className="w-32">
-              <Field label="잔고($)" value={bilBalance} onChange={setBilBalance} />
-            </div>
-          </div>
-        </div>
-
-        <div className="panel rounded-lg overflow-hidden">
-          <button onClick={() => setShowRules((s) => !s)} className="w-full flex items-center justify-between p-4">
-            <div className="text-sm font-bold">매수 트리거 규칙 (개별 적용)</div>
-            {showRules ? <ChevronUp size={16} color="#8B96A5" /> : <ChevronDown size={16} color="#8B96A5" />}
-          </button>
-          {showRules && (
-            <div className="px-4 pb-4 space-y-3" style={{ color: "#B8C1CA", fontSize: "12px" }}>
-              <RuleRow color="#3DDC97" title="정상" desc="정기 분할매수 유지" />
-              <RuleRow color="#FFB020" title="1단계 (종목별 1차 트리거 도달)" desc="분할매수 금액 2배로 확대" />
-              <RuleRow color="#FF5C5C" title="2단계 (종목별 2차 트리거 도달)" desc="BIL 매도 → 추가 매수 집행" />
-              <div className="flex items-start gap-2 pt-2" style={{ borderTop: "1px solid #1F262D" }}>
-                <AlertTriangle size={14} color="#8B96A5" style={{ marginTop: 2, flexShrink: 0 }} />
-                <span>집행 전 확인: 섹터 전체 동반 하락인지, 개별 기업 고유 리스크인지 먼저 구분할 것</span>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="text-center pt-2 pb-4" style={{ color: "#4A535C", fontSize: "11px" }}>
-          1단계 목표수량을 채우면 상단 스텝이 자동으로 2단계로 넘어가요.
-          {lastSaved && <div className="mono mt-1">마지막 저장 {new Date(lastSaved).toLocaleString("ko-KR")}</div>}
-          {saveError && <div style={{ color: "#FF5C5C" }} className="mt-1">저장 중 오류가 발생했습니다.</div>}
-        </div>
-      </div>
-
-      {showSettings && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
-          <div className="panel rounded-lg p-5 space-y-4 w-full max-w-md max-h-[90vh] overflow-y-auto" style={{ background: "#12161B", border: "1px solid #1F262D" }}>
-            <div className="flex items-center justify-between pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
-              <div className="text-base font-bold text-white flex items-center gap-2"><Settings size={18} color="#4FD1C5" /> 환경 설정</div>
-              <button onClick={() => setShowSettings(false)} className="p-1 hover:bg-gray-800 rounded"><X size={18} color="#8B96A5" /></button>
-            </div>
-            
-            <div className="pt-1 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
-              <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 활성화됨</div>
-              <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 백엔드 서버에만 안전하게 고정되어 브라우저에 노출되지 않습니다.</div>
-            </div>
-            
-            <div className="flex items-end gap-2">
-              <div className="flex-1"><Field label="환율 (₩/$)" value={exchangeRate} onChange={setExchangeRate} /></div>
-              <button onClick={fetchLiveExchangeRate} disabled={isUpdatingRate} className="px-3 py-1.5 rounded hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "12px", border: "1px solid #1F262D", height: "34px" }}>
-                {isUpdatingRate ? "조회중" : "자동 갱신"}
-              </button>
-            </div>
-            
-            <Field label="BIL 최소 비중(%, 전체자산 대비)" value={bilMinPct} onChange={setBilMinPct} />
-            
-            {/* 🛡️ 보완 3: 백업 및 복원 UI 추가 */}
-            <div className="pt-4" style={{ borderTop: "1px solid #1F262D" }}>
-              <div className="text-sm font-bold text-white mb-2">데이터 백업 / 복원</div>
-              <div className="flex gap-2">
-                <button onClick={handleExportData} className="flex-1 py-2 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>
-                  내보내기 (.json)
-                </button>
-                <label className="flex-1 py-2 rounded-md hover:bg-gray-800 text-center cursor-pointer" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "12px", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  불러오기
-                  <input type="file" accept=".json" onChange={handleImportData} style={{ display: "none" }} />
-                </label>
-              </div>
-            </div>
-
-            <div className="pt-2">
-              <button onClick={() => setShowSettings(false)} className="w-full py-2.5 rounded-md font-bold text-center hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "13px" }}>설정 완료 닫기</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {hint && <div className="mt-0.5" style={{ color: "#4A535C", fontSize: "9px" }}>{hint}</div>}
     </div>
   );
 }
@@ -926,16 +578,6 @@ function DonutChart({ segments, size = 148, strokeWidth = 20 }) {
   );
 }
 
-function Field({ label, value, onChange }) {
-  return (
-    <div>
-      <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>{label}</div>
-      <input type="number" value={value} onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-        className="mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
-    </div>
-  );
-}
-
 function RuleRow({ color, title, desc }) {
   return (
     <div className="flex items-center gap-3">
@@ -943,6 +585,355 @@ function RuleRow({ color, title, desc }) {
       <div>
         <div className="mono font-bold" style={{ color: "#E8ECEF" }}>{title}</div>
         <div style={{ color: "#8B96A5" }}>{desc}</div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ [7] 기능 컴포넌트 ═══════════════════════════════════════════════
+
+function ActionPanel({ summary, onJumpHolding, onJumpBil }) {
+  const items = summary.actionItems;
+  const count = items.length + (summary.bilLow ? 1 : 0);
+  return (
+    <div className="panel rounded-lg overflow-hidden" style={{ border: count > 0 ? "1px solid #4A2126" : "1px solid #1F262D" }}>
+      <div className="p-4 pb-2 flex items-center gap-2">
+        <AlertTriangle size={16} color={count > 0 ? "#FFB020" : "#3DDC97"} />
+        <div className="text-sm font-bold">지금 확인할 항목 {count > 0 ? `${count}건` : ""}</div>
+      </div>
+      {count === 0 ? (
+        <div className="px-4 pb-4" style={{ color: "#3DDC97", fontSize: "12px" }}>모든 종목 정상 · 매수 트리거 없음</div>
+      ) : (
+        <div className="px-4 pb-4 flex flex-wrap gap-2">
+          {items.map(({ h, status }) => (
+            <button key={h.id} onClick={() => onJumpHolding(h.id)} className="flex items-center gap-1.5 rounded-full px-3 py-2" style={{ background: "#1A2027" }}>
+              <span className="w-2 h-2 rounded-full led" style={{ background: STATUS_META[status].color, color: STATUS_META[status].color }} />
+              <span className="mono font-bold text-sm">{h.ticker}</span>
+            </button>
+          ))}
+          {summary.bilLow && (
+            <button onClick={onJumpBil} className="flex items-center gap-1.5 rounded-full px-3 py-2" style={{ background: "#1A2027" }}>
+              <span className="w-2 h-2 rounded-full led" style={{ background: "#FFB020", color: "#FFB020" }} />
+              <span className="mono font-bold text-sm">BIL</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SummaryPanel({ summary, goals }) {
+  const s = summary;
+  return (
+    <div className="panel rounded-lg p-5">
+      <div className="flex items-baseline justify-between flex-wrap gap-2">
+        <div>
+          <div style={{ color: "#8B96A5", fontSize: "12px" }}>총 평가액 (1단계+2단계+현금)</div>
+          <div className="mono text-3xl font-bold">{fmtKRWShort(s.totalValueKRW)}</div>
+          <div className="flex items-center gap-2 mt-1">
+            <div className="mono" style={{ color: "#8B96A5", fontSize: "12px" }}>{fmtUSD(s.totalValueUSD)}</div>
+            {s.totalInvestedUSD > 0 && (
+              <div className="mono" style={{ color: s.totalProfitUSD >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
+                ({s.totalProfitUSD >= 0 ? "+" : ""}{s.totalYieldPct.toFixed(1)}%)
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="text-right">
+          <div style={{ color: "#8B96A5", fontSize: "12px" }}>트리거 발동 자산</div>
+          <div className="mono text-2xl font-bold" style={{ color: s.triggeredCount > 0 ? "#FFB020" : "#3DDC97" }}>{s.triggeredCount}건</div>
+        </div>
+      </div>
+
+      <div className="mt-5">
+        <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
+          <span>1단계 · 목표 달성률 (평가액 기준){s.phase1Done ? " · 완료" : ""}</span>
+          <span className="mono" style={{ color: s.phase1Done ? "#3DDC97" : "#8B96A5" }}>{s.phase1Progress.toFixed(1)}%</span>
+        </div>
+        <div className="w-full rounded-full h-2" style={{ background: "#1A2027" }}>
+          <div className="h-2 rounded-full" style={{ width: `${s.phase1Progress}%`, background: s.phase1Done ? "#3DDC97" : "#4FD1C5" }} />
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
+          <span>2단계 목표 · {fmtKRWShort(goals.finalGoalKRW)} (달성 시 3단계 진입)</span>
+          <span className="mono">{s.finalProgress.toFixed(2)}%</span>
+        </div>
+        <div className="w-full h-3 rounded-full overflow-hidden flex" style={{ background: "#1A2027" }}>
+          <div style={{ width: `${s.seg1}%`, background: "#4FD1C5" }} />
+          <div style={{ width: `${s.seg2}%`, background: "#B18CFF" }} />
+          <div style={{ width: `${s.seg3}%`, background: CASH_COLOR }} />
+        </div>
+        <div className="flex gap-3 mt-2 flex-wrap" style={{ color: "#8B96A5", fontSize: "11px" }}>
+          <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: "#4FD1C5" }} />1단계 {fmtKRWShort(s.phase1KRW)}</span>
+          <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: "#B18CFF" }} />2단계(SCHD·SCHG) {fmtKRWShort(s.phase2KRW)}</span>
+          <span><span className="inline-block w-2 h-2 rounded-full mr-1" style={{ background: CASH_COLOR }} />현금(BIL) {fmtKRWShort(s.cashKRW)}</span>
+        </div>
+      </div>
+
+      <div className="mt-4">
+        <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "12px" }}>
+          <span>3단계 최종목표 · 연 배당(세전) {fmtKRWShort(goals.dividendGoalKRW)}{s.dividendGoalReached ? " · 달성" : ""}</span>
+          <span className="mono" style={{ color: s.dividendGoalReached ? "#60A5FA" : "#8B96A5" }}>{fmtKRWShort(s.annualDividendKRW)}</span>
+        </div>
+        <div className="w-full rounded-full h-2" style={{ background: "#1A2027" }}>
+          <div className="h-2 rounded-full" style={{ width: `${s.dividendProgress}%`, background: s.dividendGoalReached ? "#60A5FA" : "#B18CFF" }} />
+        </div>
+        <div className="mt-1" style={{ color: "#5C666F", fontSize: "11px" }}>{s.dividendProgress.toFixed(1)}% · 세전 기준, 실수령액은 배당소득세 등 공제 후 감소</div>
+      </div>
+
+      <div className="flex mt-5 gap-2">
+        {["성장자산 매집", "SCHD·SCHG 전환", "배당 전환"].map((label, i) => (
+          <div key={label} className="flex-1 text-center">
+            <div className="mono mb-1" style={{ color: i === s.currentPhaseIdx ? "#4FD1C5" : i < s.currentPhaseIdx ? "#3DDC97" : "#4A535C", fontSize: "11px" }}>{`0${i + 1}`}</div>
+            <div className="h-1 rounded-full mb-1" style={{ background: i === s.currentPhaseIdx ? "#4FD1C5" : i < s.currentPhaseIdx ? "#3DDC97" : "#1F262D" }} />
+            <div style={{ color: i === s.currentPhaseIdx ? "#E8ECEF" : "#4A535C", fontSize: "11px" }}>{label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AllocationPanel({ summary, holdings, phase2, bilBalance }) {
+  const s = summary;
+  const bars = [
+    ...holdings.map((h) => ({ key: h.id, ticker: h.ticker, value: h.qty * h.price, color: h.category === "core" ? CATEGORY_COLORS.core : CATEGORY_COLORS.satellite })),
+    ...phase2.map((p) => ({ key: p.id, ticker: p.ticker, value: p.qty * p.price, color: CATEGORY_COLORS.phase2 })),
+    { key: "bil", ticker: "BIL", value: bilBalance, color: CATEGORY_COLORS.cash }
+  ].filter((x) => x.value > 0).sort((a, b) => b.value - a.value);
+  const maxVal = bars.length ? Math.max.apply(null, bars.map((y) => y.value)) : 1;
+
+  return (
+    <div className="panel rounded-lg p-5">
+      <div className="mb-3" style={{ color: "#8B96A5", fontSize: "12px" }}>자산 현황</div>
+      <div className="flex items-center gap-5 flex-wrap">
+        <div className="relative flex-shrink-0" style={{ width: 148, height: 148 }}>
+          <DonutChart
+            size={148}
+            strokeWidth={20}
+            segments={[
+              { value: s.coreValueUSD, color: CATEGORY_COLORS.core },
+              { value: s.satelliteValueUSD, color: CATEGORY_COLORS.satellite },
+              { value: s.phase2ValueUSD, color: CATEGORY_COLORS.phase2 },
+              { value: bilBalance, color: CATEGORY_COLORS.cash }
+            ]}
+          />
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <div className="mono font-bold" style={{ fontSize: "13px" }}>{fmtKRWShort(s.totalValueKRW)}</div>
+            <div style={{ color: "#5C666F", fontSize: "10px" }}>총 자산</div>
+          </div>
+        </div>
+        <div className="flex-1 min-w-[140px] space-y-1.5" style={{ fontSize: "11px", color: "#8B96A5" }}>
+          <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: CATEGORY_COLORS.core }} />1단계 핵심</span><span className="mono">{s.corePct.toFixed(0)}%</span></div>
+          <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: CATEGORY_COLORS.satellite }} />1단계 위성</span><span className="mono">{s.satellitePct.toFixed(0)}%</span></div>
+          <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: CATEGORY_COLORS.phase2 }} />2단계 SCHD·SCHG</span><span className="mono">{s.phase2Pct.toFixed(0)}%</span></div>
+          <div className="flex justify-between"><span><span className="inline-block w-2 h-2 rounded-full mr-1.5" style={{ background: CATEGORY_COLORS.cash }} />현금(BIL)</span><span className="mono">{s.cashPct.toFixed(0)}%</span></div>
+        </div>
+      </div>
+
+      {bars.length > 0 && (
+        <div className="mt-5 pt-4 space-y-2" style={{ borderTop: "1px solid #1F262D" }}>
+          {bars.map((x) => (
+            <div key={x.key} className="flex items-center gap-2">
+              <div className="mono flex-shrink-0" style={{ width: 44, color: "#8B96A5", fontSize: "11px" }}>{x.ticker}</div>
+              <div className="flex-1 rounded-full h-2" style={{ background: "#1A2027" }}>
+                <div className="h-2 rounded-full" style={{ width: `${(x.value / maxVal) * 100}%`, background: x.color }} />
+              </div>
+              <div className="mono flex-shrink-0 text-right" style={{ width: 72, fontSize: "11px" }}>{fmtUSD(x.value)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RulesPanel({ open, onToggle }) {
+  return (
+    <div className="panel rounded-lg overflow-hidden">
+      <button onClick={onToggle} className="w-full flex items-center justify-between p-4">
+        <div className="text-sm font-bold">매수 트리거 규칙 (개별 적용)</div>
+        {open ? <ChevronUp size={16} color="#8B96A5" /> : <ChevronDown size={16} color="#8B96A5" />}
+      </button>
+      {open && (
+        <div className="px-4 pb-4 space-y-3" style={{ color: "#B8C1CA", fontSize: "12px" }}>
+          <RuleRow color="#3DDC97" title="정상" desc="정기 분할매수 유지" />
+          <RuleRow color="#FFB020" title="1단계 (종목별 1차 트리거 도달)" desc="분할매수 금액 2배로 확대" />
+          <RuleRow color="#FF5C5C" title="2단계 (종목별 2차 트리거 도달)" desc="BIL 매도 → 추가 매수 집행" />
+          <div className="flex items-start gap-2 pt-2" style={{ borderTop: "1px solid #1F262D" }}>
+            <AlertTriangle size={14} color="#8B96A5" style={{ marginTop: 2, flexShrink: 0 }} />
+            <span>집행 전 확인: 섹터 전체 동반 하락인지, 개별 기업 고유 리스크인지 먼저 구분할 것</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BilCard({ innerRef, bilBalance, onChange, summary, bilMinPct }) {
+  return (
+    <div ref={innerRef} className="panel rounded-lg p-4" style={{ border: summary.bilLow ? "1px solid #4A3B1F" : "1px solid #1F262D" }}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-bold">대기자금 (BIL)</div>
+          <div style={{ color: summary.bilLow ? "#FFB020" : "#8B96A5", fontSize: "11px" }}>
+            {summary.bilLow ? `⚠ 전체자산 대비 ${summary.bilPctOfTotal.toFixed(1)}% (최소 ${bilMinPct}% 권장)` : `전체자산 대비 ${summary.bilPctOfTotal.toFixed(1)}% · 트리거 집행 실탄`}
+          </div>
+        </div>
+        <div className="w-32">
+          <Field label="잔고($)" value={bilBalance} onChange={onChange} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, busy, refreshDisabled, weightPct, registerRef }) {
+  const [delArmed, fireDelete] = useArmed(2500);
+  const status = statusOf(h);
+  const meta = STATUS_META[status];
+  const d = dropPct(h);
+  const value = h.qty * h.price;
+  const yld = calcYield(h);
+  const prf = calcProfit(h);
+  const targetQty = h.targetQty || 0;
+  const remainingQty = Math.max(0, targetQty - h.qty);
+  const remainingAmount = remainingQty * h.price;
+  const targetProgress = targetQty > 0 ? Math.min(100, (h.qty / targetQty) * 100) : 0;
+
+  return (
+    <div ref={registerRef} className="panel rounded-lg overflow-hidden">
+      <div className="flex items-center justify-between p-4 cursor-pointer" onClick={onToggle}>
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-2.5 h-2.5 rounded-full led flex-shrink-0" style={{ background: meta.color, color: meta.color }} />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="mono font-bold text-sm">{h.ticker}</span>
+              <span style={{ color: "#8B96A5", fontSize: "12px" }}>{h.name}</span>
+              {h.isCrypto && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "10px" }}>코인</span>}
+            </div>
+            <div className="mt-0.5" style={{ color: meta.color, fontSize: "11px" }}>{meta.label} · {d.toFixed(1)}%</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          <div className="mono text-sm font-bold mr-1">{fmtUSD(value)}</div>
+          <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} disabled={busy || refreshDisabled} aria-label={h.ticker + " 시세 갱신"} className="p-2 hover:bg-gray-800 rounded">
+            <RefreshCw size={15} color="#4FD1C5" className={busy ? "animate-spin" : ""} />
+          </button>
+          <button onClick={(e) => { e.stopPropagation(); fireDelete(onDelete); }} aria-label={h.ticker + " 삭제"} className="p-2 hover:bg-gray-800 rounded flex items-center gap-1" style={delArmed ? { background: "#3A171B" } : null}>
+            <Trash2 size={15} color={delArmed ? "#FF5C5C" : "#4A535C"} />
+            {delArmed && <span style={{ color: "#FF5C5C", fontSize: "10px", fontWeight: "bold" }}>확인</span>}
+          </button>
+          {expanded ? <ChevronUp size={16} color="#8B96A5" /> : <ChevronDown size={16} color="#8B96A5" />}
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="px-4 pb-4" style={{ borderTop: "1px solid #1F262D" }}>
+          <div className="grid grid-cols-3 gap-2 mt-3">
+            <Field label="수량" value={h.qty} onChange={(v) => onChange("qty", v)} />
+            <Field label="평단가($)" value={h.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
+            <Field label="현재가($)" value={h.price} onChange={(v) => onChange("price", v)} />
+          </div>
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <Field label="52주 고가($)" value={h.high52} onChange={(v) => onChange("high52", v)} />
+            <Field label="목표수량(주/개)" value={h.targetQty || 0} onChange={(v) => onChange("targetQty", v)} />
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 mt-2 pt-2" style={{ borderTop: "1px dashed #1F262D" }}>
+            <Field label="1차 트리거(%)" negative value={h.t1 || 0} onChange={(v) => onChange("t1", v)} />
+            <Field label="2차 트리거(%)" negative value={h.t2 || 0} onChange={(v) => onChange("t2", v)} />
+            <Field label="과거 MDD(%)" negative value={h.mdd || 0} onChange={(v) => onChange("mdd", v)} />
+          </div>
+          <div className="mt-1" style={{ color: "#4A535C", fontSize: "9px" }}>고점 대비 하락률 기준 · 0 입력 시 해당 트리거 미사용</div>
+
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <Field label="연배당($/주)" value={h.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
+            <div>
+              <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
+              <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(h.qty * (h.divPerShare || 0))}</div>
+            </div>
+          </div>
+
+          <div className="flex justify-between items-center mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="mono" style={{ color: d <= 0 ? "#FF5C5C" : "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>현재하락 {d.toFixed(1)}%</span>
+                <span className="mono" style={{ color: "#5C666F", fontSize: "10px" }}>(최악기준 {h.mdd || 0}%)</span>
+              </div>
+              {h.qty > 0 && h.avgPrice > 0 && (
+                <div className="mono mt-0.5" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
+                  수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
+                </div>
+              )}
+            </div>
+            <div className="text-right mono" style={{ color: "#8B96A5", fontSize: "11px" }}>비중 {(weightPct || 0).toFixed(1)}%</div>
+          </div>
+
+          {targetQty > 0 && (
+            <div className="mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+              <div className="flex justify-between mb-1" style={{ color: "#8B96A5", fontSize: "11px" }}>
+                <span>수량 달성률 (목표 {targetQty}주)</span>
+                <span className="mono">{targetProgress.toFixed(0)}%</span>
+              </div>
+              <div className="w-full rounded-full h-1.5 mb-1.5" style={{ background: "#1A2027" }}>
+                <div className="h-1.5 rounded-full" style={{ width: `${targetProgress}%`, background: remainingQty <= 0 ? "#3DDC97" : "#4FD1C5" }} />
+              </div>
+              <div className="mono" style={{ color: remainingQty <= 0 ? "#3DDC97" : "#B8C1CA", fontSize: "12px" }}>
+                {remainingQty <= 0 ? "✅ 수량 목표 달성!" : `목표까지 ${remainingQty}주 남음 (약 ${fmtUSD(remainingAmount)} 필요)`}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Phase2Card({ p, onChange, onRefresh, busy, refreshDisabled, weightPct }) {
+  const value = p.qty * p.price;
+  const d = dropPct(p);
+  const yld = calcYield(p);
+  const prf = calcProfit(p);
+  return (
+    <div className="panel rounded-lg p-4">
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="mono font-bold text-sm">{p.ticker}</span>
+            <span style={{ color: "#8B96A5", fontSize: "12px" }}>{p.name}</span>
+          </div>
+          <div style={{ color: "#8B96A5", fontSize: "11px" }} className="mt-0.5">고점대비 {d.toFixed(1)}%</div>
+        </div>
+        <button onClick={onRefresh} disabled={busy || refreshDisabled} aria-label={p.ticker + " 시세 갱신"} className="p-2 hover:bg-gray-800 rounded">
+          <RefreshCw size={15} color="#4FD1C5" className={busy ? "animate-spin" : ""} />
+        </button>
+      </div>
+      <div className="grid grid-cols-3 gap-2 mt-3">
+        <Field label="수량" value={p.qty} onChange={(v) => onChange("qty", v)} />
+        <Field label="평단가($)" value={p.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
+        <Field label="현재가($)" value={p.price} onChange={(v) => onChange("price", v)} />
+      </div>
+      <div className="grid grid-cols-2 gap-2 mt-2">
+        <Field label="연배당($/주)" value={p.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
+        <div>
+          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
+          <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(p.qty * (p.divPerShare || 0))}</div>
+        </div>
+      </div>
+      <div className="flex justify-between items-center mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+        <div>
+          {p.qty > 0 && p.avgPrice > 0 && (
+            <div className="mono" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
+              수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
+            </div>
+          )}
+          <div className="mono mt-0.5" style={{ color: "#8B96A5", fontSize: "11px" }}>비중 {(weightPct || 0).toFixed(1)}%</div>
+        </div>
+        <div className="mono text-sm font-bold">{fmtUSD(value)}</div>
       </div>
     </div>
   );
@@ -968,28 +959,26 @@ function AddHoldingForm({ onAdd, onCancel }) {
   const [searching, setSearching] = useState(false);
   const [autoFilling, setAutoFilling] = useState(false);
   const [autoFilled, setAutoFilled] = useState(false);
+  const [note, setNote] = useState("");
   const searchTimer = useRef(null);
 
   useEffect(() => {
-    if (ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
+    // 코인 모드에서는 주식 심볼 검색을 띄우지 않음
+    if (isCrypto || ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const res = await fetch(`${PROXY_URL}?endpoint=search&q=${encodeURIComponent(ticker)}`);
-        if (res.ok) {
-          const data = await res.json();
-          const list = (data.result || []).slice(0, 6);
-          setSuggestions(list);
-          setShowSuggestions(list.length > 0);
-        }
+        const list = await apiSearch(ticker);
+        setSuggestions(list);
+        setShowSuggestions(list.length > 0);
       } catch (e) {
       } finally {
         setSearching(false);
       }
     }, 350);
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
-  }, [ticker]);
+  }, [ticker, isCrypto]);
 
   async function selectSuggestion(item) {
     setTicker(item.symbol);
@@ -997,30 +986,42 @@ function AddHoldingForm({ onAdd, onCancel }) {
     setShowSuggestions(false);
     setSuggestions([]);
     setAutoFilled(false);
+    setNote("");
     setAutoFilling(true);
     try {
-      const res = await fetch(`${PROXY_URL}?endpoint=quote&symbol=${item.symbol}`);
-      let newHigh = 0;
-      if (res.ok) {
-        const data = await res.json();
-        if (!(data.c === 0 && data.h === 0)) {
-          setPrice(data.c);
-          newHigh = Math.max(data.c, data.h || 0);
-          setHigh52(newHigh);
-        }
+      const q = await apiQuote(item.symbol).catch(() => null);
+      if (q) {
+        setPrice(q.price);
+        setHigh52(Math.max(q.price, q.dayHigh || 0));
       }
-      const metricRes = await fetch(`${PROXY_URL}?endpoint=metric&symbol=${item.symbol}`);
-      if (metricRes.ok) {
-        const metricData = await metricRes.json();
-        const m = metricData && metricData.metric;
-        if (m) {
-          const div = (typeof m.dividendPerShareTTM === "number") ? m.dividendPerShareTTM : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null);
-          if (div != null) setDivPerShare(div);
-          if (typeof m["52WeekHigh"] === "number") setHigh52((prev) => Math.max(prev, m["52WeekHigh"]));
-        }
-      }
+      const m = await apiMetric(item.symbol);
+      if (m.div != null) setDivPerShare(m.div);
+      if (m.high52 > 0) setHigh52((prev) => Math.max(prev, m.high52));
       setAutoFilled(true);
     } catch (e) {
+      setNote("자동 채우기 실패 — 시세를 직접 입력해 주세요");
+    } finally {
+      setAutoFilling(false);
+    }
+  }
+
+  async function fillCryptoPrice() {
+    const t = ticker.trim().toUpperCase();
+    if (!t) return;
+    if (!CRYPTO_IDS[t]) {
+      setNote("자동 시세 미지원 코인이에요 · 직접 입력 (지원: " + SUPPORTED_COINS_LABEL + ")");
+      return;
+    }
+    setAutoFilling(true);
+    setNote("");
+    try {
+      const prices = await apiCryptoPrices([t]);
+      if (prices[t] == null) throw new Error("no price");
+      setPrice(prices[t]);
+      setHigh52((prev) => Math.max(prev, prices[t]));
+      setAutoFilled(true);
+    } catch (e) {
+      setNote("코인 시세 조회 실패 — 직접 입력해 주세요");
     } finally {
       setAutoFilling(false);
     }
@@ -1030,18 +1031,18 @@ function AddHoldingForm({ onAdd, onCancel }) {
     <div className="panel rounded-lg p-4 mb-2 space-y-3">
       <div className="grid grid-cols-2 gap-2">
         <div className="relative">
-          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요</span></div>
+          <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 {!isCrypto && <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요</span>}</div>
           <input
             value={ticker}
             onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }}
             onFocus={() => setShowSuggestions(suggestions.length > 0)}
             onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
-            className="mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
+            className="tinput mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
           {searching && <div style={{ position: "absolute", right: 8, top: 30, fontSize: "10px", color: "#5C666F" }}>검색중</div>}
           {showSuggestions && (
             <div className="absolute z-10 w-full mt-1 rounded-md" style={{ background: "#0B0E11", border: "1px solid #1F262D", maxHeight: "180px", overflowY: "auto" }}>
               {suggestions.map((s) => (
-                <button key={s.symbol} type="button" onClick={() => selectSuggestion(s)} className="w-full text-left px-2 py-1.5 hover:bg-gray-800" style={{ fontSize: "11px", color: "#E8ECEF", borderBottom: "1px solid #1F262D" }}>
+                <button key={s.symbol} type="button" onClick={() => selectSuggestion(s)} className="w-full text-left px-2 py-2 hover:bg-gray-800" style={{ fontSize: "11px", color: "#E8ECEF", borderBottom: "1px solid #1F262D" }}>
                   <span className="mono font-bold">{s.symbol}</span> <span style={{ color: "#8B96A5" }}>{s.description}</span>
                 </button>
               ))}
@@ -1050,11 +1051,12 @@ function AddHoldingForm({ onAdd, onCancel }) {
         </div>
         <div>
           <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>이름</div>
-          <input value={name} onChange={(e) => setName(e.target.value)} className="w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
+          <input value={name} onChange={(e) => setName(e.target.value)} className="tinput w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
         </div>
       </div>
       {autoFilling && <div style={{ color: "#4FD1C5", fontSize: "11px" }}>시세·배당 자동으로 채우는 중...</div>}
       {autoFilled && !autoFilling && <div style={{ color: "#3DDC97", fontSize: "11px" }}>현재가·52주고가·배당을 자동으로 채웠어요 · 필요하면 직접 수정하세요</div>}
+      {note && !autoFilling && <div style={{ color: "#FFB020", fontSize: "11px" }}>{note}</div>}
       <div className="grid grid-cols-3 gap-2">
         <Field label="수량" value={qty} onChange={setQty} />
         <Field label="평단가($)" value={avgPrice} onChange={setAvgPrice} />
@@ -1065,30 +1067,562 @@ function AddHoldingForm({ onAdd, onCancel }) {
         <Field label="목표수량(주/개)" value={targetQty} onChange={setTargetQty} />
       </div>
       <div className="grid grid-cols-3 gap-2 pt-2" style={{ borderTop: "1px dashed #1F262D" }}>
-        <Field label="1차 트리거(%)" value={t1} onChange={setT1} />
-        <Field label="2차 트리거(%)" value={t2} onChange={setT2} />
-        <Field label="과거 MDD(%)" value={mdd} onChange={setMdd} />
+        <Field label="1차 트리거(%)" negative value={t1} onChange={setT1} />
+        <Field label="2차 트리거(%)" negative value={t2} onChange={setT2} />
+        <Field label="과거 MDD(%)" negative value={mdd} onChange={setMdd} />
       </div>
       <Field label="연배당($/주)" value={divPerShare} onChange={setDivPerShare} />
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-1.5" style={{ color: "#B8C1CA", fontSize: "12px" }}>
           <input type="checkbox" checked={category === "satellite"} onChange={(e) => setCategory(e.target.checked ? "satellite" : "core")} /> 위성자산
         </label>
         <label className="flex items-center gap-1.5" style={{ color: "#B8C1CA", fontSize: "12px" }}>
-          <input type="checkbox" checked={isCrypto} onChange={(e) => setIsCrypto(e.target.checked)} /> 코인
+          <input type="checkbox" checked={isCrypto} onChange={(e) => { setIsCrypto(e.target.checked); setNote(""); }} /> 코인
         </label>
+        {isCrypto && (
+          <button type="button" onClick={fillCryptoPrice} disabled={autoFilling} className="px-2 py-1 rounded hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "11px", border: "1px solid #1F262D" }}>
+            코인 현재가 불러오기
+          </button>
+        )}
       </div>
       <div className="flex gap-2 pt-1">
-        <button onClick={() => { if (ticker) onAdd({ ticker, name: name || ticker, category, isCrypto, qty, avgPrice, price, high52, targetQty, t1, t2, mdd, divPerShare }); }}
-          className="flex-1 py-2 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>추가</button>
-        <button onClick={onCancel} className="flex-1 py-2 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "12px" }}>취소</button>
+        <button onClick={() => { if (ticker) onAdd({ ticker: ticker.trim().toUpperCase(), name: name || ticker, category, isCrypto, qty, avgPrice, price, high52, targetQty, t1, t2, mdd, divPerShare }); }}
+          className="flex-1 py-2.5 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>추가</button>
+        <button onClick={onCancel} className="flex-1 py-2.5 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "12px" }}>취소</button>
       </div>
     </div>
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<PortfolioConsole />);
+function SettingsModal({ onClose, exchangeRate, onRateChange, onFetchFx, fxBusy, bilMinPct, onBilMinChange, goals, onGoalsChange, onExport, onImportFile, lastBackupAt, backupStale, onResetAll }) {
+  const [resetArmed, fireReset] = useArmed(3000);
+  return (
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+      <div className="panel rounded-lg p-5 space-y-4 w-full max-w-md max-h-[90vh] overflow-y-auto" style={{ background: "#12161B", border: "1px solid #1F262D" }}>
+        <div className="flex items-center justify-between pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
+          <div className="text-base font-bold text-white flex items-center gap-2"><Settings size={18} color="#4FD1C5" /> 환경 설정</div>
+          <button onClick={onClose} aria-label="설정 닫기" className="p-1 hover:bg-gray-800 rounded"><X size={18} color="#8B96A5" /></button>
+        </div>
 
+        <div className="pt-1 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
+          <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 활성화됨</div>
+          <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 백엔드 서버에만 안전하게 고정되어 브라우저에 노출되지 않습니다.</div>
+        </div>
+
+        <div className="flex items-end gap-2">
+          <div className="flex-1"><Field label="환율 (₩/$)" value={exchangeRate} onChange={onRateChange} /></div>
+          <button onClick={onFetchFx} disabled={fxBusy} className="px-3 py-1.5 rounded hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "12px", border: "1px solid #1F262D", height: "34px" }}>
+            {fxBusy ? "조회중" : "자동 갱신"}
+          </button>
+        </div>
+
+        <Field label="BIL 최소 비중(%, 전체자산 대비)" value={bilMinPct} onChange={onBilMinChange} />
+
+        <div className="pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+          <div className="text-sm font-bold text-white mb-2">목표 금액</div>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="2단계 목표 (억원)" value={goals.finalGoalKRW / 100000000} onChange={(v) => onGoalsChange({ finalGoalKRW: Math.max(0, v) * 100000000, dividendGoalKRW: goals.dividendGoalKRW })} />
+            <Field label="연 배당 목표 (만원)" value={goals.dividendGoalKRW / 10000} onChange={(v) => onGoalsChange({ finalGoalKRW: goals.finalGoalKRW, dividendGoalKRW: Math.max(0, v) * 10000 })} />
+          </div>
+          <div className="mt-1" style={{ color: "#4A535C", fontSize: "10px" }}>대시보드의 2·3단계 진행률이 이 값 기준으로 계산돼요</div>
+        </div>
+
+        <div className="pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+          <div className="text-sm font-bold text-white mb-1">데이터 백업 / 복원</div>
+          <div className="mb-2" style={{ color: backupStale ? "#FFB020" : "#8B96A5", fontSize: "11px" }}>
+            {lastBackupAt ? "마지막 백업 · " + new Date(lastBackupAt).toLocaleDateString("ko-KR") : "아직 백업 기록이 없어요"}
+            {backupStale ? " · 백업을 권장해요" : ""}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={onExport} className="flex-1 py-2 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>
+              내보내기 (.json)
+            </button>
+            <label className="flex-1 py-2 rounded-md hover:bg-gray-800 text-center cursor-pointer" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "12px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              불러오기
+              <input type="file" accept=".json,application/json" onChange={onImportFile} style={{ display: "none" }} />
+            </label>
+          </div>
+        </div>
+
+        <div className="pt-3" style={{ borderTop: "1px solid #1F262D" }}>
+          <button onClick={() => fireReset(onResetAll)} className="w-full py-2 rounded-md" style={{ background: resetArmed ? "#3A171B" : "#1A2027", color: resetArmed ? "#FF5C5C" : "#8B96A5", fontSize: "12px", border: "1px solid " + (resetArmed ? "#4A2126" : "#1F262D") }}>
+            {resetArmed ? "정말 초기화할까요? 한 번 더 누르면 실행돼요" : "전체 데이터 초기화"}
+          </button>
+        </div>
+
+        <div className="pt-1">
+          <button onClick={onClose} className="w-full py-2.5 rounded-md font-bold text-center hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "13px" }}>설정 완료 닫기</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══ [8] APP ════════════════════════════════════════════════════════
+// 상태 보관 + 저장 + 시세 오케스트레이션만 담당. 화면은 [7]의 컴포넌트로 위임.
+
+function PortfolioConsole() {
+  const [holdings, setHoldings] = useState(() => DEFAULT_HOLDINGS.map((h) => Object.assign({}, h)));
+  const [phase2, setPhase2] = useState(() => DEFAULT_PHASE2.map((p) => Object.assign({}, p)));
+  const [bilBalance, setBilBalance] = useState(0);
+  const [exchangeRate, setExchangeRate] = useState(1480);
+  const [bilMinPct, setBilMinPct] = useState(10);
+  const [goals, setGoals] = useState(() => Object.assign({}, DEFAULT_GOALS));
+  const [lastPriceSync, setLastPriceSync] = useState(null);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+
+  const [loaded, setLoaded] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showRules, setShowRules] = useState(true);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [lastSaved, setLastSaved] = useState(null);
+  const [saveError, setSaveError] = useState(false);
+  const [busyKey, setBusyKey] = useState(null);      // 개별 갱신 중인 자산 id
+  const [bulk, setBulk] = useState(null);            // 전체 갱신 진행률 {done,total} | null
+  const [fxBusy, setFxBusy] = useState(false);
+  const [hasRefreshedThisSession, setHasRefreshedThisSession] = useState(false);
+  const [expandedIds, setExpandedIds] = useState({});
+  const [toasts, setToasts] = useState([]);
+
+  const saveTimer = useRef(null);
+  const cardRefs = useRef({});
+  const bilCardRef = useRef(null);
+  const toastSeq = useRef(0);
+
+  // ── 토스트 ──
+  const removeToast = useCallback((id) => setToasts((p) => p.filter((t) => t.id !== id)), []);
+  const toast = useCallback((type, msg, ms) => {
+    var id = ++toastSeq.current;
+    setToasts((p) => p.slice(-3).concat([{ id: id, type: type, msg: msg }]));
+    var life = ms || (type === "error" ? 6000 : type === "warn" ? 5000 : 3200);
+    setTimeout(function () { removeToast(id); }, life);
+  }, [removeToast]);
+
+  // ── 불러오기 (v6 → v7 자동 이전 포함) ──
+  useEffect(() => {
+    var res = loadPersistedState();
+    if (res) {
+      var st = res.state;
+      setHoldings(st.holdings);
+      setPhase2(st.phase2);
+      setBilBalance(st.bilBalance);
+      setExchangeRate(st.exchangeRate);
+      setBilMinPct(st.bilMinPct);
+      setGoals(st.goals);
+      setLastPriceSync(st.lastPriceSync);
+      setLastBackupAt(st.lastBackupAt);
+      if (st.lastUpdated) setLastSaved(st.lastUpdated);
+      if (res.migrated) toast("info", "기존 데이터를 새 버전(v7)으로 옮겨왔어요");
+    }
+    setLoaded(true);
+  }, []);
+
+  // ── 자동 저장 (0.7초 디바운스) ──
+  useEffect(() => {
+    if (!loaded) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt });
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        setSaveError(false);
+        setLastSaved(payload.lastUpdated);
+      } catch (e) {
+        setSaveError(true);
+      }
+    }, 700);
+    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
+  }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt, loaded]);
+
+  // ── 자산 수정/추가/삭제 ──
+  // 현재가 수정 시 52주 고가를 자동 상향하는 규칙을 1·2단계가 공유
+  const makeFieldUpdater = (setList) => (id, field, v) => {
+    setList((prev) => prev.map((x) => {
+      if (x.id !== id) return x;
+      if (field === "price") return Object.assign({}, x, { price: v, high52: Math.max(v, toNum(x.high52, 0)) });
+      var o = Object.assign({}, x);
+      o[field] = v;
+      return o;
+    }));
+  };
+  const changeHolding = useMemo(() => makeFieldUpdater(setHoldings), []);
+  const changePhase2 = useMemo(() => makeFieldUpdater(setPhase2), []);
+
+  function removeHoldingById(id) {
+    setHoldings((prev) => prev.filter((h) => h.id !== id));
+    toast("info", "종목을 삭제했어요");
+  }
+
+  function addHolding(nh) {
+    var normalized = normalizeHolding(Object.assign({}, nh, { id: uid() }));
+    var dup = holdings.concat(phase2).some((x) => x.ticker === normalized.ticker);
+    setHoldings((prev) => prev.concat([normalized]));
+    setShowAddForm(false);
+    if (dup) toast("warn", normalized.ticker + " — 같은 티커가 이미 있어요 (중복으로 추가됨)");
+    else toast("success", normalized.ticker + " 추가 완료");
+  }
+
+  function toggleExpand(id) { setExpandedIds((prev) => Object.assign({}, prev, { [id]: !prev[id] })); }
+  function jumpToHolding(id) {
+    setExpandedIds((prev) => Object.assign({}, prev, { [id]: true }));
+    setTimeout(() => {
+      var el = cardRefs.current[id];
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+  }
+  function jumpToBil() {
+    if (bilCardRef.current) bilCardRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  // ── 시세 갱신 ──
+  function applyToList(scope, id, q) {
+    var upd = (list) => list.map((x) => (x.id === id ? applyQuoteToAsset(x, q) : x));
+    if (scope === "holding") setHoldings(upd);
+    else setPhase2(upd);
+  }
+
+  async function refreshAsset(asset, scope) {
+    if (bulk) { toast("info", "전체 갱신이 진행 중이에요"); return; }
+    if (asset.isCrypto) {
+      if (!CRYPTO_IDS[asset.ticker]) {
+        toast("warn", asset.ticker + "는 자동 시세 미지원 코인이에요 · 직접 입력 (지원: " + SUPPORTED_COINS_LABEL + ")");
+        return;
+      }
+      var ckey = "crypto:" + asset.ticker;
+      if (underCooldown(ckey, COOLDOWN_MS.crypto)) {
+        toast("info", asset.ticker + " 재조회는 " + cooldownLeft(ckey, COOLDOWN_MS.crypto) + "초 후에 가능해요");
+        return;
+      }
+      setBusyKey(asset.id);
+      try {
+        var prices = await apiCryptoPrices([asset.ticker]);
+        if (prices[asset.ticker] == null) throw new Error("no price");
+        applyToList(scope, asset.id, { price: prices[asset.ticker], dayHigh: 0, metricHigh: 0, div: null });
+        markCooldown(ckey);
+        setLastPriceSync(new Date().toISOString());
+      } catch (e) {
+        toast("error", asset.ticker + " 시세 조회 실패 — 잠시 후 다시 시도하거나 직접 입력해 주세요");
+      } finally {
+        setBusyKey(null);
+      }
+      return;
+    }
+    var skey = "stock:" + asset.ticker;
+    if (underCooldown(skey, COOLDOWN_MS.stock)) {
+      toast("info", asset.ticker + " 재조회는 " + cooldownLeft(skey, COOLDOWN_MS.stock) + "초 후에 가능해요");
+      return;
+    }
+    setBusyKey(asset.id);
+    try {
+      var results = await Promise.all([apiQuote(asset.ticker), apiMetric(asset.ticker)]);
+      applyToList(scope, asset.id, { price: results[0].price, dayHigh: results[0].dayHigh, metricHigh: results[1].high52, div: results[1].div });
+      markCooldown(skey);
+      setLastPriceSync(new Date().toISOString());
+    } catch (e) {
+      toast("error", asset.ticker + " 조회 실패 — 티커를 확인해 주세요");
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  // 전체 갱신: 환율 → 코인(1회 일괄) → 주식(순차) 순서로 진행률 표시
+  async function refreshAllPrices() {
+    if (bulk) return;
+    if (underCooldown("bulk", COOLDOWN_MS.bulk)) {
+      toast("info", "전체 갱신은 " + cooldownLeft("bulk", COOLDOWN_MS.bulk) + "초 후에 다시 가능해요");
+      return;
+    }
+    var stockTargets = holdings.filter((h) => !h.isCrypto).map((h) => ({ scope: "holding", id: h.id, ticker: h.ticker }))
+      .concat(phase2.map((p) => ({ scope: "phase2", id: p.id, ticker: p.ticker })));
+    var cryptoTickers = [];
+    holdings.forEach((h) => { if (h.isCrypto && cryptoTickers.indexOf(h.ticker) === -1) cryptoTickers.push(h.ticker); });
+
+    var total = stockTargets.length + (cryptoTickers.length ? 1 : 0) + 1; // +1 = 환율
+    setBulk({ done: 0, total: total });
+    var failed = [];
+    var step = () => setBulk((b) => (b ? { done: b.done + 1, total: b.total } : b));
+
+    try { setExchangeRate(await apiFxKRW()); } catch (e) { failed.push("환율"); }
+    step();
+
+    if (cryptoTickers.length) {
+      try {
+        var cp = await apiCryptoPrices(cryptoTickers);
+        setHoldings((prev) => prev.map((x) => {
+          if (!x.isCrypto) return x;
+          var pr = cp[x.ticker];
+          return pr == null ? x : applyQuoteToAsset(x, { price: pr, dayHigh: 0, metricHigh: 0, div: null });
+        }));
+        cryptoTickers.forEach((t) => { if (cp[t] == null) failed.push(t); });
+      } catch (e) {
+        failed.push("코인 일괄");
+      }
+      step();
+    }
+
+    for (var i = 0; i < stockTargets.length; i++) {
+      var tgt = stockTargets[i];
+      try {
+        var r = await Promise.all([apiQuote(tgt.ticker), apiMetric(tgt.ticker)]);
+        applyToList(tgt.scope, tgt.id, { price: r[0].price, dayHigh: r[0].dayHigh, metricHigh: r[1].high52, div: r[1].div });
+      } catch (e) {
+        failed.push(tgt.ticker);
+      }
+      step();
+      await new Promise((res) => setTimeout(res, 250));
+    }
+
+    markCooldown("bulk");
+    setLastPriceSync(new Date().toISOString());
+    setBulk(null);
+    setHasRefreshedThisSession(true);
+    if (failed.length) toast("warn", "일부 조회 실패: " + failed.join(", "));
+    else toast("success", "전체 시세 갱신 완료");
+  }
+
+  async function fetchFx() {
+    setFxBusy(true);
+    try {
+      setExchangeRate(await apiFxKRW());
+      toast("success", "환율을 갱신했어요");
+    } catch (e) {
+      toast("error", "환율 자동 조회 실패 — 직접 입력해 주세요");
+    } finally {
+      setFxBusy(false);
+    }
+  }
+
+  // ── 백업 / 복원 / 초기화 ──
+  // 내보내기는 localStorage가 아닌 "현재 화면의 상태"를 직렬화합니다.
+  // (저장 디바운스 0.7초 사이의 최신 수정분 누락 버그 수정)
+  function handleExportData() {
+    try {
+      var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt });
+      var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "portfolio_backup_" + new Date().toISOString().split("T")[0] + ".json";
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      setLastBackupAt(new Date().toISOString());
+      toast("success", "백업 파일을 내보냈어요");
+    } catch (e) {
+      toast("error", "백업 파일 생성에 실패했어요");
+    }
+  }
+
+  function handleImportData(e) {
+    var file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        var data = JSON.parse(evt.target.result);
+        if (!data || !Array.isArray(data.holdings)) {
+          toast("error", "유효하지 않은 백업 파일이에요 — holdings 항목이 없어요");
+          return;
+        }
+        var st = normalizeState(data);
+        setHoldings(st.holdings);
+        setPhase2(st.phase2);
+        setBilBalance(st.bilBalance);
+        setExchangeRate(st.exchangeRate);
+        setBilMinPct(st.bilMinPct);
+        setGoals(st.goals);
+        setLastPriceSync(st.lastPriceSync);
+        setLastBackupAt(st.lastBackupAt);
+        toast("success", "백업 복원 완료 · 종목 " + st.holdings.length + "개");
+      } catch (err) {
+        toast("error", "파일을 읽지 못했어요 — JSON 형식을 확인해 주세요");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleResetAll() {
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    setHoldings(DEFAULT_HOLDINGS.map((h) => Object.assign({}, h)));
+    setPhase2(DEFAULT_PHASE2.map((p) => Object.assign({}, p)));
+    setBilBalance(0);
+    setExchangeRate(1480);
+    setBilMinPct(10);
+    setGoals(Object.assign({}, DEFAULT_GOALS));
+    setLastPriceSync(null);
+    setLastBackupAt(null);
+    setExpandedIds({});
+    toast("success", "전체 데이터를 초기화했어요");
+  }
+
+  // ── 파생 상태 ──
+  const summary = useMemo(
+    () => computeSummary({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals }),
+    [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals]
+  );
+  const priceStale = lastPriceSync && isStale(lastPriceSync, 20);
+  const needsInitialSync = !hasRefreshedThisSession && isStale(lastPriceSync, 1);
+  const backupStale = !lastBackupAt || isStale(lastBackupAt, 24 * 30);
+
+  return (
+    <div style={{ fontFamily: "'Noto Sans KR', sans-serif", background: "#0B0E11", minHeight: "100vh", color: "#E8ECEF", paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 64px)" }} className="w-full min-h-screen relative">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .panel { background: #12161B; border: 1px solid #1F262D; }
+        .led { box-shadow: 0 0 8px 1px currentColor; }
+        * { -webkit-tap-highlight-color: transparent; }
+        button, label { touch-action: manipulation; }
+        input { outline: none; }
+        .fld:focus-within { border-color: #4FD1C5 !important; }
+        .tinput:focus { border-color: #4FD1C5 !important; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-thumb { background: #1F262D; border-radius: 2px; }
+        @keyframes pulseGlow {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.45); }
+          50% { box-shadow: 0 0 0 10px rgba(79, 209, 197, 0); }
+        }
+        .pulse-cta { animation: pulseGlow 1.8s ease-in-out infinite; }
+        @keyframes toastIn {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .toast-item { animation: toastIn 0.18s ease-out; }
+      `}</style>
+
+      <div style={{ position: "sticky", top: 0, zIndex: 40, background: "rgba(11,14,17,0.92)", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", borderBottom: "1px solid #1F262D", paddingTop: "env(safe-area-inset-top, 0px)" }}>
+        <div className="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="mono tracking-widest" style={{ color: "#4FD1C5", fontSize: "11px" }}>{APP_VERSION}</span>
+              {lastPriceSync && (
+                <span className="mono" style={{ color: priceStale ? "#FFB020" : "#5C666F", fontSize: "10px" }}>
+                  시세 {fmtSyncTime(lastPriceSync)}{priceStale ? " · 오래됨" : ""}
+                </span>
+              )}
+            </div>
+            <div className="text-lg font-bold">자산 관제 콘솔</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={refreshAllPrices} disabled={!!bulk} aria-label="전체 시세 갱신" className="p-2 rounded-md hover:bg-gray-800 flex items-center gap-1.5" style={{ background: "#1A2027", minHeight: 40 }}>
+              <RefreshCw size={17} color="#4FD1C5" className={bulk ? "animate-spin" : ""} />
+              <span className="mono" style={{ color: "#4FD1C5", fontSize: "11px" }}>{bulk ? bulk.done + "/" + bulk.total : "전체갱신"}</span>
+            </button>
+            <button onClick={() => setShowSettings(true)} aria-label="환경 설정" className="p-2 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", minHeight: 40, minWidth: 40 }}>
+              <Settings size={17} color="#8B96A5" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-3xl mx-auto px-4 pt-5 space-y-5">
+        {needsInitialSync && (
+          <button onClick={refreshAllPrices} disabled={!!bulk} className="w-full rounded-lg p-4 flex items-center justify-center gap-2 pulse-cta"
+            style={{ background: "#132A28", border: "1px solid #4FD1C5" }}>
+            <RefreshCw size={18} color="#4FD1C5" className={bulk ? "animate-spin" : ""} />
+            <span style={{ color: "#4FD1C5", fontSize: "13px", fontWeight: "bold" }}>
+              {bulk ? "최신 시세 불러오는 중... " + bulk.done + "/" + bulk.total : "시작 전, 최신 시세로 한 번 갱신하기"}
+            </span>
+          </button>
+        )}
+
+        {summary.isEmpty && (
+          <div className="panel rounded-lg px-4 py-3" style={{ color: "#8B96A5", fontSize: "12px", lineHeight: 1.6 }}>
+            아직 입력된 보유 수량이 없어요. 종목 카드를 눌러 <span style={{ color: "#E8ECEF" }}>수량·평단가</span>를 입력하면 모든 집계가 자동으로 시작돼요.
+          </div>
+        )}
+
+        <ActionPanel summary={summary} onJumpHolding={jumpToHolding} onJumpBil={jumpToBil} />
+
+        <SummaryPanel summary={summary} goals={goals} />
+
+        <AllocationPanel summary={summary} holdings={holdings} phase2={phase2} bilBalance={bilBalance} />
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-bold">1단계 · 보유자산</div>
+            <button onClick={() => setShowAddForm((s) => !s)} className="flex items-center gap-1 px-3 py-2 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "12px" }}>
+              <Plus size={14} /> 추가
+            </button>
+          </div>
+
+          {showAddForm && <AddHoldingForm onAdd={addHolding} onCancel={() => setShowAddForm(false)} />}
+
+          <div className="space-y-2">
+            {holdings.map((h) => (
+              <HoldingCard
+                key={h.id}
+                h={h}
+                expanded={!!expandedIds[h.id]}
+                onToggle={() => toggleExpand(h.id)}
+                onChange={(field, v) => changeHolding(h.id, field, v)}
+                onDelete={() => removeHoldingById(h.id)}
+                onRefresh={() => refreshAsset(h, "holding")}
+                busy={busyKey === h.id}
+                refreshDisabled={!!bulk}
+                weightPct={summary.weights[h.id]}
+                registerRef={(el) => { cardRefs.current[h.id] = el; }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-bold">2단계 · SCHD·SCHG (배당·성장 코어)</div>
+            <div style={{ color: "#8B96A5", fontSize: "11px" }}>{fmtUSD(summary.phase2ValueUSD)}</div>
+          </div>
+          <div className="space-y-2">
+            {phase2.map((p) => (
+              <Phase2Card
+                key={p.id}
+                p={p}
+                onChange={(field, v) => changePhase2(p.id, field, v)}
+                onRefresh={() => refreshAsset(p, "phase2")}
+                busy={busyKey === p.id}
+                refreshDisabled={!!bulk}
+                weightPct={summary.weights[p.id]}
+              />
+            ))}
+          </div>
+        </div>
+
+        <BilCard innerRef={bilCardRef} bilBalance={bilBalance} onChange={setBilBalance} summary={summary} bilMinPct={bilMinPct} />
+
+        <RulesPanel open={showRules} onToggle={() => setShowRules((s) => !s)} />
+
+        <div className="text-center pt-2 pb-4" style={{ color: "#4A535C", fontSize: "11px" }}>
+          1단계 목표수량을 채우면 상단 스텝이 자동으로 2단계로 넘어가요.
+          {lastSaved && <div className="mono mt-1">마지막 저장 {new Date(lastSaved).toLocaleString("ko-KR")}</div>}
+          {saveError && <div style={{ color: "#FF5C5C" }} className="mt-1">저장 중 오류가 발생했습니다. 백업 내보내기를 권장해요.</div>}
+        </div>
+      </div>
+
+      {showSettings && (
+        <SettingsModal
+          onClose={() => setShowSettings(false)}
+          exchangeRate={exchangeRate}
+          onRateChange={setExchangeRate}
+          onFetchFx={fetchFx}
+          fxBusy={fxBusy}
+          bilMinPct={bilMinPct}
+          onBilMinChange={setBilMinPct}
+          goals={goals}
+          onGoalsChange={setGoals}
+          onExport={handleExportData}
+          onImportFile={handleImportData}
+          lastBackupAt={lastBackupAt}
+          backupStale={backupStale}
+          onResetAll={handleResetAll}
+        />
+      )}
+
+      <ToastHost toasts={toasts} onClose={removeToast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<PortfolioConsole />);
 </script>
 </body>
 </html>
