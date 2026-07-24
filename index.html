@@ -64,87 +64,42 @@ window.addEventListener('load', function() {
 
 <script type="text/plain" id="app-src">
 // ════════════════════════════════════════════════════════════════════
-//  자산 관제 콘솔 · PF-07
-//
-//  파일은 아래 8개 모듈로 구성됩니다. 기능을 확장할 때는 해당 모듈만
-//  수정하면 되고, UI 컴포넌트는 계산 로직([5])을 몰라도 됩니다.
-//
-//  [1] CONFIG      설정값·기본 데이터. 코인 추가, 쿨타임, 색상 등은 여기 한 곳만 수정
-//  [2] UTILS       포맷/변환 순수 함수
-//  [3] STORAGE     저장·불러오기·버전 마이그레이션(v6→v7 자동)·백업 직렬화
-//  [4] MARKET API  모든 외부 통신(주식/코인/환율) 창구 + 쿨타임 관리
-//  [5] CALC        도메인 계산(트리거 판정, 포트폴리오 집계). 전부 순수 함수
-//  [6] 공용 UI     아이콘, 입력 필드, 토스트, 도넛 차트 등 재사용 부품
-//  [7] 기능 컴포넌트  카드/패널/모달 등 화면 단위 부품
-//  [8] APP         상태 보관과 배선만 담당하는 얇은 최상위 컴포넌트
+//  자산 관제 콘솔 · PF-09 (자동완성 UI 개선 및 반응속도 최적화)
 // ════════════════════════════════════════════════════════════════════
 
 // ═══ [1] CONFIG ═════════════════════════════════════════════════════
 
-const APP_VERSION = "PF-07";
-const SCHEMA_VERSION = 7;
-const STORAGE_KEY = "portfolio-data-v7";
-// 이전 버전 키. 처음 실행 시 여기서 데이터를 읽어와 v7로 자동 이전합니다.
-// (원본 v6 데이터는 지우지 않고 남겨두어 비상 복구용으로 사용 가능)
-const LEGACY_STORAGE_KEYS = ["portfolio-data-v6"];
+const APP_VERSION = "PF-09";
+const SCHEMA_VERSION = 8;
+const STORAGE_KEY = "portfolio-data-v8";
+const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
 
 const PROXY_URL = "https://finnhub-proxy.seowonhaha.workers.dev";
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price";
 const FX_URL = "https://open.er-api.com/v6/latest/USD";
 
-// 자동 시세를 지원할 코인 목록. 새 코인은 여기 한 줄만 추가하면
-// 개별 갱신·전체 갱신·추가 폼 자동 채우기에 모두 반영됩니다.
-// (값은 CoinGecko의 coin id)
-const CRYPTO_IDS = {
-  BTC: "bitcoin",
-  ETH: "ethereum",
-  SOL: "solana",
-  XRP: "ripple",
-  DOGE: "dogecoin",
-  ADA: "cardano",
-  AVAX: "avalanche-2",
-  LINK: "chainlink"
-};
+const CRYPTO_IDS = { BTC: "bitcoin", ETH: "ethereum", SOL: "solana", XRP: "ripple", DOGE: "dogecoin", ADA: "cardano", AVAX: "avalanche-2", LINK: "chainlink" };
 const SUPPORTED_COINS_LABEL = Object.keys(CRYPTO_IDS).join(", ");
-
-// API 재조회 최소 간격 (ms)
 const COOLDOWN_MS = { stock: 10000, crypto: 30000, bulk: 20000 };
 
-// 목표 금액 기본값 — 실제 값은 설정 화면에서 수정 가능하며 저장됩니다.
-const DEFAULT_GOALS = {
-  finalGoalKRW: 2000000000,   // 2단계 목표 (원)
-  dividendGoalKRW: 80000000   // 3단계 연 배당 목표 (원, 세전)
-};
-
+const DEFAULT_GOALS = { finalGoalKRW: 2000000000, dividendGoalKRW: 80000000 };
 const CASH_COLOR = "#3B82F6";
 const CATEGORY_COLORS = { core: "#4FD1C5", satellite: "#FFB020", phase2: "#B18CFF", cash: CASH_COLOR };
-const STATUS_META = {
-  normal: { label: "정상", color: "#3DDC97" },
-  t1:     { label: "2배 매수", color: "#FFB020" },
-  t2:     { label: "BIL 집행", color: "#FF5C5C" },
-  done:   { label: "목표 달성", color: "#60A5FA" }
-};
+const STATUS_META = { normal: { label: "정상", color: "#3DDC97" }, t1: { label: "2배 매수", color: "#FFB020" }, t2: { label: "BIL 집행", color: "#FF5C5C" }, done: { label: "목표 달성", color: "#60A5FA" } };
 
-// 새 종목의 누락 필드를 채울 기본값 (마이그레이션에도 사용)
-const HOLDING_DEFAULTS = { category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 0, high52: 0, targetQty: 0, t1: -15, t2: -30, mdd: 0, divPerShare: 0 };
-const PHASE2_DEFAULTS = { qty: 0, avgPrice: 0, price: 0, high52: 0, divPerShare: 0 };
+// 국내 주식 확장을 위한 isKRW 속성 추가
+const HOLDING_DEFAULTS = { category: "core", isCrypto: false, isKRW: false, qty: 0, avgPrice: 0, price: 0, high52: 0, targetQty: 0, t1: -15, t2: -30, mdd: 0, divPerShare: 0 };
+const PHASE2_DEFAULTS = { isKRW: false, qty: 0, avgPrice: 0, price: 0, high52: 0, divPerShare: 0 };
 
+// 첫 사용자 온보딩을 위해 테슬라와 비트코인만 예시로 남김
 const DEFAULT_HOLDINGS = [
-  { id: "h1", ticker: "TSLA", name: "테슬라", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 400, high52: 463, targetQty: 100, t1: -25, t2: -40, mdd: -74, divPerShare: 0 },
-  { id: "h2", ticker: "SMH", name: "SMH", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 600, high52: 672, targetQty: 40, t1: -15, t2: -25, mdd: -56, divPerShare: 0 },
-  { id: "h3", ticker: "DRAM", name: "Roundhill Memory", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 58.85, high52: 81.34, targetQty: 200, t1: -15, t2: -25, mdd: -30, divPerShare: 0 },
-  { id: "h4", ticker: "GOOGL", name: "구글", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 359.91, high52: 400, targetQty: 30, t1: -10, t2: -20, mdd: -45, divPerShare: 0 },
-  { id: "h5", ticker: "NVDA", name: "엔비디아", category: "core", isCrypto: false, qty: 0, avgPrice: 0, price: 194.83, high52: 213, targetQty: 50, t1: -20, t2: -35, mdd: -65, divPerShare: 0 },
-  { id: "h6", ticker: "PLTR", name: "팔란티어", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 134.44, high52: 207.52, targetQty: 100, t1: -25, t2: -40, mdd: -85, divPerShare: 0 },
-  { id: "h7", ticker: "QTUM", name: "퀀텀 ETF", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 144.17, high52: 170, targetQty: 100, t1: -15, t2: -25, mdd: -40, divPerShare: 0 },
-  { id: "h8", ticker: "SPCX", name: "스페이스X", category: "satellite", isCrypto: false, qty: 0, avgPrice: 0, price: 120, high52: 225.64, targetQty: 200, t1: -20, t2: -40, mdd: -50, divPerShare: 0 },
-  { id: "h9", ticker: "BTC", name: "비트코인", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 66509, high52: 124000, targetQty: 1, t1: -25, t2: -40, mdd: -84, divPerShare: 0 },
-  { id: "h10", ticker: "ETH", name: "이더리움", category: "satellite", isCrypto: true, qty: 0, avgPrice: 0, price: 1928.62, high52: 4000, targetQty: 5, t1: -30, t2: -50, mdd: -94, divPerShare: 0 }
+  { id: "h1", ticker: "TSLA", name: "테슬라", category: "core", isCrypto: false, isKRW: false, qty: 0, avgPrice: 0, price: 400, high52: 463, targetQty: 100, t1: -25, t2: -40, mdd: -74, divPerShare: 0 },
+  { id: "h2", ticker: "BTC", name: "비트코인", category: "satellite", isCrypto: true, isKRW: false, qty: 0, avgPrice: 0, price: 66509, high52: 124000, targetQty: 1, t1: -25, t2: -40, mdd: -84, divPerShare: 0 }
 ];
 
 const DEFAULT_PHASE2 = [
-  { id: "p1", ticker: "SCHD", name: "SCHD (배당 코어)", qty: 0, avgPrice: 0, price: 32.92, high52: 33.50, divPerShare: 1.05 },
-  { id: "p2", ticker: "SCHG", name: "SCHG (성장 코어)", qty: 0, avgPrice: 0, price: 34.27, high52: 35.42, divPerShare: 0.12 }
+  { id: "p1", ticker: "SCHD", name: "SCHD (배당 코어)", isKRW: false, qty: 0, avgPrice: 0, price: 32.92, high52: 33.50, divPerShare: 1.05 },
+  { id: "p2", ticker: "SCHG", name: "SCHG (성장 코어)", isKRW: false, qty: 0, avgPrice: 0, price: 34.27, high52: 35.42, divPerShare: 0.12 }
 ];
 
 // ═══ [2] UTILS ══════════════════════════════════════════════════════
@@ -152,10 +107,14 @@ const DEFAULT_PHASE2 = [
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 function uid() { return "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
-
 function toNum(v, fallback) { var n = Number(v); return isFinite(n) ? n : fallback; }
+function toUSD(val, isKRW, fx) { return (isKRW && fx > 0) ? val / fx : val; }
 
-function fmtUSD(n) { return !isFinite(n) ? "$0" : "$" + Math.round(n).toLocaleString("en-US"); }
+function fmtCurrency(n, isKRW) {
+  if (!isFinite(n)) n = 0;
+  if (isKRW) return "₩" + Math.round(n).toLocaleString("ko-KR");
+  return "$" + Math.round(n).toLocaleString("en-US");
+}
 
 function fmtKRWShort(n) {
   if (!isFinite(n)) return "0원";
@@ -170,7 +129,6 @@ function fmtKRWShort(n) {
   return sign + Math.round(abs).toLocaleString("ko-KR") + "원";
 }
 
-// iso 시각이 hours 시간보다 오래됐는지 (값이 없으면 오래된 것으로 취급)
 function isStale(iso, hours) {
   if (!iso) return true;
   var t = Date.parse(iso);
@@ -189,8 +147,6 @@ function fmtSyncTime(iso) {
 }
 
 // ═══ [3] STORAGE ════════════════════════════════════════════════════
-// 저장 스키마가 바뀌면: SCHEMA_VERSION 올리고, normalize에서 새 필드의
-// 기본값만 채워주면 됩니다. 과거 데이터는 자동으로 보정됩니다.
 
 function normalizeHolding(raw) {
   var h = Object.assign({}, HOLDING_DEFAULTS, raw || {});
@@ -199,11 +155,8 @@ function normalizeHolding(raw) {
   h.name = h.name || h.ticker;
   h.category = h.category === "satellite" ? "satellite" : "core";
   h.isCrypto = !!h.isCrypto;
-  ["qty", "avgPrice", "price", "high52", "targetQty", "divPerShare"].forEach(function (k) {
-    h[k] = Math.max(0, toNum(h[k], 0));
-  });
-  // 트리거는 "고점 대비 하락률"이므로 항상 음수여야 합니다.
-  // 과거에 양수로 저장된 값(항상 발동되는 버그 원인)을 음수로 정규화. 0은 미사용.
+  h.isKRW = !!h.isKRW;
+  ["qty", "avgPrice", "price", "high52", "targetQty", "divPerShare"].forEach(function (k) { h[k] = Math.max(0, toNum(h[k], 0)); });
   ["t1", "t2", "mdd"].forEach(function (k) {
     var t = toNum(h[k], HOLDING_DEFAULTS[k]);
     h[k] = t === 0 ? 0 : -Math.abs(t);
@@ -216,30 +169,21 @@ function normalizePhase2(raw) {
   p.id = (typeof p.id === "string" && p.id) ? p.id : uid();
   p.ticker = String(p.ticker || "").toUpperCase();
   p.name = p.name || p.ticker;
-  ["qty", "avgPrice", "price", "high52", "divPerShare"].forEach(function (k) {
-    p[k] = Math.max(0, toNum(p[k], 0));
-  });
+  p.isKRW = !!p.isKRW;
+  ["qty", "avgPrice", "price", "high52", "divPerShare"].forEach(function (k) { p[k] = Math.max(0, toNum(p[k], 0)); });
   return p;
 }
 
-// 어떤 버전의 payload가 와도 항상 완전한 v7 상태 객체로 변환
 function normalizeState(raw) {
   raw = raw || {};
   var goalsRaw = raw.goals || {};
   return {
-    holdings: Array.isArray(raw.holdings) && raw.holdings.length
-      ? raw.holdings.map(normalizeHolding)
-      : DEFAULT_HOLDINGS.map(function (h) { return Object.assign({}, h); }),
-    phase2: Array.isArray(raw.phase2) && raw.phase2.length
-      ? raw.phase2.map(normalizePhase2)
-      : DEFAULT_PHASE2.map(function (p) { return Object.assign({}, p); }),
+    holdings: Array.isArray(raw.holdings) && raw.holdings.length ? raw.holdings.map(normalizeHolding) : DEFAULT_HOLDINGS.map(function (h) { return Object.assign({}, h); }),
+    phase2: Array.isArray(raw.phase2) && raw.phase2.length ? raw.phase2.map(normalizePhase2) : DEFAULT_PHASE2.map(function (p) { return Object.assign({}, p); }),
     bilBalance: Math.max(0, toNum(raw.bilBalance, 0)),
     exchangeRate: toNum(raw.exchangeRate, 1480) > 0 ? toNum(raw.exchangeRate, 1480) : 1480,
     bilMinPct: Math.max(0, toNum(raw.bilMinPct, 10)),
-    goals: {
-      finalGoalKRW: Math.max(0, toNum(goalsRaw.finalGoalKRW, DEFAULT_GOALS.finalGoalKRW)),
-      dividendGoalKRW: Math.max(0, toNum(goalsRaw.dividendGoalKRW, DEFAULT_GOALS.dividendGoalKRW))
-    },
+    goals: { finalGoalKRW: Math.max(0, toNum(goalsRaw.finalGoalKRW, DEFAULT_GOALS.finalGoalKRW)), dividendGoalKRW: Math.max(0, toNum(goalsRaw.dividendGoalKRW, DEFAULT_GOALS.dividendGoalKRW)) },
     lastPriceSync: typeof raw.lastPriceSync === "string" ? raw.lastPriceSync : null,
     lastBackupAt: typeof raw.lastBackupAt === "string" ? raw.lastBackupAt : null,
     lastUpdated: typeof raw.lastUpdated === "string" ? raw.lastUpdated : null
@@ -247,21 +191,9 @@ function normalizeState(raw) {
 }
 
 function serializeState(s) {
-  return {
-    schemaVersion: SCHEMA_VERSION,
-    holdings: s.holdings,
-    phase2: s.phase2,
-    bilBalance: s.bilBalance,
-    exchangeRate: s.exchangeRate,
-    bilMinPct: s.bilMinPct,
-    goals: s.goals,
-    lastPriceSync: s.lastPriceSync,
-    lastBackupAt: s.lastBackupAt,
-    lastUpdated: new Date().toISOString()
-  };
+  return { schemaVersion: SCHEMA_VERSION, holdings: s.holdings, phase2: s.phase2, bilBalance: s.bilBalance, exchangeRate: s.exchangeRate, bilMinPct: s.bilMinPct, goals: s.goals, lastPriceSync: s.lastPriceSync, lastBackupAt: s.lastBackupAt, lastUpdated: new Date().toISOString() };
 }
 
-// v7 키 → 없으면 레거시 키 순서로 탐색. 레거시에서 읽으면 v7로 즉시 복사.
 function loadPersistedState() {
   try {
     var raw = localStorage.getItem(STORAGE_KEY);
@@ -274,15 +206,11 @@ function loadPersistedState() {
         return { state: st, migrated: true };
       }
     }
-  } catch (e) {
-    console.warn("저장 데이터 파싱 오류", e);
-  }
+  } catch (e) { console.warn("데이터 파싱 오류", e); }
   return null;
 }
 
 // ═══ [4] MARKET API ═════════════════════════════════════════════════
-// 외부 통신은 전부 이 모듈을 통합니다. 새 데이터 소스를 붙일 때도
-// 여기에 api* 함수 하나만 추가하면 UI 쪽 수정이 최소화됩니다.
 
 var __cooldowns = {};
 function underCooldown(key, ms) { return Date.now() - (__cooldowns[key] || 0) < ms; }
@@ -301,43 +229,35 @@ async function apiQuote(ticker) {
   return { price: d.c, dayHigh: d.h || 0 };
 }
 
-// 배당·52주 고가. 실패해도 조용히 빈 값을 돌려서 시세 갱신을 막지 않음
 async function apiMetric(ticker) {
   try {
     var d = await fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker));
     var m = d && d.metric;
     if (!m) return { div: null, high52: 0 };
-    var div = typeof m.dividendPerShareTTM === "number" ? m.dividendPerShareTTM
-      : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null);
+    var div = typeof m.dividendPerShareTTM === "number" ? m.dividendPerShareTTM : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null);
     var high = typeof m["52WeekHigh"] === "number" ? m["52WeekHigh"] : 0;
     return { div: (typeof div === "number" && div >= 0) ? div : null, high52: high };
-  } catch (e) {
-    return { div: null, high52: 0 };
-  }
+  } catch (e) { return { div: null, high52: 0 }; }
 }
 
 async function apiSearch(q) {
   var d = await fetchJson(PROXY_URL + "?endpoint=search&q=" + encodeURIComponent(q));
   var all = (d && d.result) || [];
-  // 해외 교차상장(BRK.A 형태 제외한 "TSLA.MX" 등) 노이즈를 걸러 검색 품질 개선
-  var filtered = all.filter(function (s) { return s.symbol && s.symbol.indexOf(".") === -1; });
+  // 한국 주식/ETF 검색 지원을 위해 .KS(코스피) 및 .KQ(코스닥) 필터 통과 허용
+  var filtered = all.filter(function (s) {
+    if (!s.symbol) return false;
+    return s.symbol.indexOf(".") === -1 || s.symbol.endsWith(".KS") || s.symbol.endsWith(".KQ");
+  });
   return (filtered.length ? filtered : all).slice(0, 6);
 }
 
-// 여러 코인을 쉼표로 묶어 한 번에 조회 → { BTC: 66509, ... }
 async function apiCryptoPrices(tickers) {
   var ids = [];
-  tickers.forEach(function (t) {
-    var id = CRYPTO_IDS[t];
-    if (id && ids.indexOf(id) === -1) ids.push(id);
-  });
+  tickers.forEach(function (t) { var id = CRYPTO_IDS[t]; if (id && ids.indexOf(id) === -1) ids.push(id); });
   if (!ids.length) return {};
   var d = await fetchJson(COINGECKO_URL + "?ids=" + ids.join(",") + "&vs_currencies=usd");
   var out = {};
-  tickers.forEach(function (t) {
-    var id = CRYPTO_IDS[t];
-    if (id && d[id] && typeof d[id].usd === "number") out[t] = d[id].usd;
-  });
+  tickers.forEach(function (t) { var id = CRYPTO_IDS[t]; if (id && d[id] && typeof d[id].usd === "number") out[t] = d[id].usd; });
   return out;
 }
 
@@ -348,14 +268,11 @@ async function apiFxKRW() {
 }
 
 // ═══ [5] CALC ═══════════════════════════════════════════════════════
-// 화면과 무관한 순수 계산. 새 지표가 필요하면 computeSummary에만 추가.
 
 function calcYield(a) { return (!a.avgPrice || a.qty <= 0) ? 0 : ((a.price - a.avgPrice) / a.avgPrice) * 100; }
 function calcProfit(a) { return (!a.avgPrice || a.qty <= 0) ? 0 : (a.price - a.avgPrice) * a.qty; }
 function dropPct(a) { return (!a.high52 || a.high52 <= 0) ? 0 : ((a.price - a.high52) / a.high52) * 100; }
 
-// 트리거는 음수(하락률)일 때만 무장. 0은 미사용으로 취급해
-// "양수 트리거가 항상 발동되던" 논리 구멍을 차단.
 function statusOf(h) {
   if ((h.targetQty || 0) > 0 && h.qty >= h.targetQty) return "done";
   var d = dropPct(h);
@@ -364,8 +281,6 @@ function statusOf(h) {
   return "normal";
 }
 
-// 시세 응답을 자산에 반영하는 유일한 통로 (개별/일괄/1·2단계 공용)
-// 52주 고가는 현재가·당일고가·메트릭 52주고가 중 최댓값으로만 상향(ratchet)
 function applyQuoteToAsset(a, q) {
   var next = Object.assign({}, a, { price: q.price });
   next.high52 = Math.max(toNum(a.high52, 0), q.price, toNum(q.dayHigh, 0), toNum(q.metricHigh, 0));
@@ -373,29 +288,29 @@ function applyQuoteToAsset(a, q) {
   return next;
 }
 
-// 화면에 필요한 모든 파생 수치를 한 번에 계산하는 순수 함수.
-// App은 이 결과를 각 패널에 내려주기만 합니다.
 function computeSummary(s) {
   var holdings = s.holdings, phase2 = s.phase2, bilBalance = s.bilBalance;
   var exchangeRate = s.exchangeRate, bilMinPct = s.bilMinPct, goals = s.goals;
 
-  var phase1TargetUSD = holdings.reduce(function (sum, h) { return sum + (h.targetQty || 0) * h.price; }, 0);
-  var phase1CurrentUSD = holdings.reduce(function (sum, h) { return sum + h.qty * h.price; }, 0);
+  // 모든 가치 계산 시 한국 주식(isKRW)은 환율을 나누어 달러(USD) 장부로 일원화
+  var phase1TargetUSD = holdings.reduce(function (sum, h) { return sum + toUSD((h.targetQty || 0) * h.price, h.isKRW, exchangeRate); }, 0);
+  var phase1CurrentUSD = holdings.reduce(function (sum, h) { return sum + toUSD(h.qty * h.price, h.isKRW, exchangeRate); }, 0);
   var phase1Progress = phase1TargetUSD > 0 ? Math.min(100, (phase1CurrentUSD / phase1TargetUSD) * 100) : 0;
   var phase1Done = phase1TargetUSD > 0 && phase1CurrentUSD >= phase1TargetUSD;
 
-  var phase2ValueUSD = phase2.reduce(function (sum, p) { return sum + p.qty * p.price; }, 0);
-  var phase2InvestedUSD = phase2.reduce(function (sum, p) { return sum + p.qty * (p.avgPrice || 0); }, 0);
+  var phase2ValueUSD = phase2.reduce(function (sum, p) { return sum + toUSD(p.qty * p.price, p.isKRW, exchangeRate); }, 0);
+  var phase2InvestedUSD = phase2.reduce(function (sum, p) { return sum + toUSD(p.qty * (p.avgPrice || 0), p.isKRW, exchangeRate); }, 0);
   var phase2ProfitUSD = phase2ValueUSD - phase2InvestedUSD;
 
   var annualDividendUSD =
-    holdings.reduce(function (sum, h) { return sum + h.qty * (h.divPerShare || 0); }, 0) +
-    phase2.reduce(function (sum, p) { return sum + p.qty * (p.divPerShare || 0); }, 0);
+    holdings.reduce(function (sum, h) { return sum + toUSD(h.qty * (h.divPerShare || 0), h.isKRW, exchangeRate); }, 0) +
+    phase2.reduce(function (sum, p) { return sum + toUSD(p.qty * (p.divPerShare || 0), p.isKRW, exchangeRate); }, 0);
+  
   var annualDividendKRW = annualDividendUSD * exchangeRate;
   var dividendProgress = goals.dividendGoalKRW > 0 ? Math.min(100, (annualDividendKRW / goals.dividendGoalKRW) * 100) : 0;
   var dividendGoalReached = goals.dividendGoalKRW > 0 && annualDividendKRW >= goals.dividendGoalKRW;
 
-  var phase1InvestedUSD = holdings.reduce(function (sum, h) { return sum + h.qty * (h.avgPrice || 0); }, 0);
+  var phase1InvestedUSD = holdings.reduce(function (sum, h) { return sum + toUSD(h.qty * (h.avgPrice || 0), h.isKRW, exchangeRate); }, 0);
   var phase1ProfitUSD = phase1CurrentUSD - phase1InvestedUSD;
   var totalInvestedUSD = phase1InvestedUSD + phase2InvestedUSD;
   var totalValueUSD = phase1CurrentUSD + phase2ValueUSD + bilBalance;
@@ -416,8 +331,9 @@ function computeSummary(s) {
 
   var coreValueUSD = 0, satelliteValueUSD = 0;
   holdings.forEach(function (h) {
-    if (h.category === "core") coreValueUSD += h.qty * h.price;
-    else satelliteValueUSD += h.qty * h.price;
+    var v = toUSD(h.qty * h.price, h.isKRW, exchangeRate);
+    if (h.category === "core") coreValueUSD += v;
+    else satelliteValueUSD += v;
   });
   var totalForBar = coreValueUSD + satelliteValueUSD + phase2ValueUSD + bilBalance || 1;
   var corePct = (coreValueUSD / totalForBar) * 100;
@@ -425,11 +341,10 @@ function computeSummary(s) {
   var phase2Pct = (phase2ValueUSD / totalForBar) * 100;
   var cashPct = (bilBalance / totalForBar) * 100;
 
-  // 종목별 포트폴리오 비중 (%)
   var weights = {};
   var wBase = totalValueUSD > 0 ? totalValueUSD : 1;
-  holdings.forEach(function (h) { weights[h.id] = (h.qty * h.price / wBase) * 100; });
-  phase2.forEach(function (p) { weights[p.id] = (p.qty * p.price / wBase) * 100; });
+  holdings.forEach(function (h) { weights[h.id] = (toUSD(h.qty * h.price, h.isKRW, exchangeRate) / wBase) * 100; });
+  phase2.forEach(function (p) { weights[p.id] = (toUSD(p.qty * p.price, p.isKRW, exchangeRate) / wBase) * 100; });
   weights.bil = (bilBalance / wBase) * 100;
 
   var actionItems = holdings
@@ -440,21 +355,7 @@ function computeSummary(s) {
   var currentPhaseIdx = dividendGoalReached ? 2 : (phase1Done ? 1 : 0);
   var isEmpty = phase1CurrentUSD === 0 && phase2ValueUSD === 0;
 
-  return {
-    exchangeRate: exchangeRate,
-    phase1Progress: phase1Progress, phase1Done: phase1Done, phase1CurrentUSD: phase1CurrentUSD,
-    phase2ValueUSD: phase2ValueUSD, phase2ProfitUSD: phase2ProfitUSD,
-    annualDividendKRW: annualDividendKRW, dividendProgress: dividendProgress, dividendGoalReached: dividendGoalReached,
-    totalInvestedUSD: totalInvestedUSD, totalValueUSD: totalValueUSD, totalValueKRW: totalValueKRW,
-    totalProfitUSD: totalProfitUSD, totalYieldPct: totalYieldPct,
-    phase1KRW: phase1KRW, phase2KRW: phase2KRW, cashKRW: cashKRW,
-    finalProgress: finalProgress, seg1: seg1, seg2: seg2, seg3: seg3,
-    coreValueUSD: coreValueUSD, satelliteValueUSD: satelliteValueUSD,
-    corePct: corePct, satellitePct: satellitePct, phase2Pct: phase2Pct, cashPct: cashPct,
-    bilPctOfTotal: bilPctOfTotal, bilLow: bilLow,
-    actionItems: actionItems, triggeredCount: triggeredCount,
-    currentPhaseIdx: currentPhaseIdx, weights: weights, isEmpty: isEmpty
-  };
+  return { exchangeRate, phase1Progress, phase1Done, phase1CurrentUSD, phase2ValueUSD, phase2ProfitUSD, annualDividendKRW, dividendProgress, dividendGoalReached, totalInvestedUSD, totalValueUSD, totalValueKRW, totalProfitUSD, totalYieldPct, phase1KRW, phase2KRW, cashKRW, finalProgress, seg1, seg2, seg3, coreValueUSD, satelliteValueUSD, corePct, satellitePct, phase2Pct, cashPct, bilPctOfTotal, bilLow, actionItems, triggeredCount, currentPhaseIdx, weights, isEmpty };
 }
 
 // ═══ [6] 공용 UI ═════════════════════════════════════════════════════
@@ -471,14 +372,10 @@ const X = (p) => <IconBase {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1=
 const AlertTriangle = (p) => <IconBase {...p}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></IconBase>;
 const RefreshCw = (p) => <IconBase {...p}><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></IconBase>;
 
-// 2단계 확인 액션 훅: 첫 탭은 "무장", 일정 시간 안에 한 번 더 탭해야 실행.
-// 삭제·초기화처럼 되돌리기 어려운 동작을 실수 한 번으로부터 보호합니다.
 function useArmed(ms) {
   const [armed, setArmed] = useState(false);
   const timer = useRef(null);
-  useEffect(function () {
-    return function () { if (timer.current) clearTimeout(timer.current); };
-  }, []);
+  useEffect(function () { return function () { if (timer.current) clearTimeout(timer.current); }; }, []);
   function fire(cb) {
     if (!armed) {
       setArmed(true);
@@ -509,11 +406,6 @@ function ToastHost({ toasts, onClose }) {
   );
 }
 
-// 숫자 입력 필드 (전면 재작성)
-// - 기존 parseFloat||0 방식은 "0.5"의 소수점, "-15"의 마이너스 입력이 불가능했음
-// - 입력 중에는 문자열 상태를 유지하고, 유효한 숫자만 상위로 전달
-// - negative 모드: 트리거처럼 항상 음수인 값은 "-" 접두를 고정 표시하고
-//   사용자는 크기만 입력 → 아이폰 숫자 키패드(마이너스 없음)로도 입력 가능
 function Field({ label, value, onChange, negative, hint }) {
   function numToText(v) {
     var n = (typeof v === "number" && isFinite(v)) ? v : 0;
@@ -521,9 +413,7 @@ function Field({ label, value, onChange, negative, hint }) {
   }
   const [text, setText] = useState(numToText(value));
   const focused = useRef(false);
-  useEffect(function () {
-    if (!focused.current) setText(numToText(value));
-  }, [value, negative]);
+  useEffect(function () { if (!focused.current) setText(numToText(value)); }, [value, negative]);
 
   function handleChange(e) {
     var raw = e.target.value.replace(/[^0-9.]/g, "");
@@ -540,14 +430,7 @@ function Field({ label, value, onChange, negative, hint }) {
       <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>{label}</div>
       <div className="fld flex items-center rounded" style={{ background: "#0B0E11", border: "1px solid #1F262D" }}>
         {negative && <span className="mono pl-2" style={{ color: "#8B96A5", fontSize: "13px" }}>-</span>}
-        <input
-          type="text" inputMode="decimal" value={text}
-          onFocus={(e) => { focused.current = true; e.target.select(); }}
-          onBlur={() => { focused.current = false; setText(numToText(value)); }}
-          onChange={handleChange}
-          className="mono w-full text-sm px-2 py-1.5"
-          style={{ color: "#E8ECEF", border: "none", background: "transparent" }}
-        />
+        <input type="text" inputMode="decimal" value={text} onFocus={(e) => { focused.current = true; e.target.select(); }} onBlur={() => { focused.current = false; setText(numToText(value)); }} onChange={handleChange} className="mono w-full text-sm px-2 py-1.5" style={{ color: "#E8ECEF", border: "none", background: "transparent" }} />
       </div>
       {hint && <div className="mt-0.5" style={{ color: "#4A535C", fontSize: "9px" }}>{hint}</div>}
     </div>
@@ -569,10 +452,7 @@ function DonutChart({ segments, size = 148, strokeWidth = 20 }) {
         const gap = circumference - dash;
         const rotation = (acc / total) * 360 - 90;
         acc += seg.value;
-        return (
-          <circle key={i} cx={size / 2} cy={size / 2} r={radius} fill="none" stroke={seg.color} strokeWidth={strokeWidth}
-            strokeDasharray={`${dash} ${gap}`} strokeLinecap="butt" transform={`rotate(${rotation} ${size / 2} ${size / 2})`} />
-        );
+        return <circle key={i} cx={size / 2} cy={size / 2} r={radius} fill="none" stroke={seg.color} strokeWidth={strokeWidth} strokeDasharray={`${dash} ${gap}`} strokeLinecap="butt" transform={`rotate(${rotation} ${size / 2} ${size / 2})`} />;
       })}
     </svg>
   );
@@ -632,7 +512,7 @@ function SummaryPanel({ summary, goals }) {
           <div style={{ color: "#8B96A5", fontSize: "12px" }}>총 평가액 (1단계+2단계+현금)</div>
           <div className="mono text-3xl font-bold">{fmtKRWShort(s.totalValueKRW)}</div>
           <div className="flex items-center gap-2 mt-1">
-            <div className="mono" style={{ color: "#8B96A5", fontSize: "12px" }}>{fmtUSD(s.totalValueUSD)}</div>
+            <div className="mono" style={{ color: "#8B96A5", fontSize: "12px" }}>{fmtCurrency(s.totalValueUSD, false)}</div>
             {s.totalInvestedUSD > 0 && (
               <div className="mono" style={{ color: s.totalProfitUSD >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
                 ({s.totalProfitUSD >= 0 ? "+" : ""}{s.totalYieldPct.toFixed(1)}%)
@@ -700,8 +580,8 @@ function SummaryPanel({ summary, goals }) {
 function AllocationPanel({ summary, holdings, phase2, bilBalance }) {
   const s = summary;
   const bars = [
-    ...holdings.map((h) => ({ key: h.id, ticker: h.ticker, value: h.qty * h.price, color: h.category === "core" ? CATEGORY_COLORS.core : CATEGORY_COLORS.satellite })),
-    ...phase2.map((p) => ({ key: p.id, ticker: p.ticker, value: p.qty * p.price, color: CATEGORY_COLORS.phase2 })),
+    ...holdings.map((h) => ({ key: h.id, ticker: h.ticker, value: toUSD(h.qty * h.price, h.isKRW, s.exchangeRate), color: h.category === "core" ? CATEGORY_COLORS.core : CATEGORY_COLORS.satellite })),
+    ...phase2.map((p) => ({ key: p.id, ticker: p.ticker, value: toUSD(p.qty * p.price, p.isKRW, s.exchangeRate), color: CATEGORY_COLORS.phase2 })),
     { key: "bil", ticker: "BIL", value: bilBalance, color: CATEGORY_COLORS.cash }
   ].filter((x) => x.value > 0).sort((a, b) => b.value - a.value);
   const maxVal = bars.length ? Math.max.apply(null, bars.map((y) => y.value)) : 1;
@@ -742,7 +622,7 @@ function AllocationPanel({ summary, holdings, phase2, bilBalance }) {
               <div className="flex-1 rounded-full h-2" style={{ background: "#1A2027" }}>
                 <div className="h-2 rounded-full" style={{ width: `${(x.value / maxVal) * 100}%`, background: x.color }} />
               </div>
-              <div className="mono flex-shrink-0 text-right" style={{ width: 72, fontSize: "11px" }}>{fmtUSD(x.value)}</div>
+              <div className="mono flex-shrink-0 text-right" style={{ width: 72, fontSize: "11px" }}>{fmtCurrency(x.value, false)}</div>
             </div>
           ))}
         </div>
@@ -803,6 +683,7 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
   const remainingQty = Math.max(0, targetQty - h.qty);
   const remainingAmount = remainingQty * h.price;
   const targetProgress = targetQty > 0 ? Math.min(100, (h.qty / targetQty) * 100) : 0;
+  const sym = h.isKRW ? "₩" : "$";
 
   return (
     <div ref={registerRef} className="panel rounded-lg overflow-hidden">
@@ -814,12 +695,13 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
               <span className="mono font-bold text-sm">{h.ticker}</span>
               <span style={{ color: "#8B96A5", fontSize: "12px" }}>{h.name}</span>
               {h.isCrypto && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "10px" }}>코인</span>}
+              {h.isKRW && <span className="px-1.5 py-0.5 rounded" style={{ background: "#1A2027", color: "#B18CFF", fontSize: "10px" }}>국내</span>}
             </div>
             <div className="mt-0.5" style={{ color: meta.color, fontSize: "11px" }}>{meta.label} · {d.toFixed(1)}%</div>
           </div>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
-          <div className="mono text-sm font-bold mr-1">{fmtUSD(value)}</div>
+          <div className="mono text-sm font-bold mr-1">{fmtCurrency(value, h.isKRW)}</div>
           <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} disabled={busy || refreshDisabled} aria-label={h.ticker + " 시세 갱신"} className="p-2 hover:bg-gray-800 rounded">
             <RefreshCw size={15} color="#4FD1C5" className={busy ? "animate-spin" : ""} />
           </button>
@@ -835,11 +717,11 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
         <div className="px-4 pb-4" style={{ borderTop: "1px solid #1F262D" }}>
           <div className="grid grid-cols-3 gap-2 mt-3">
             <Field label="수량" value={h.qty} onChange={(v) => onChange("qty", v)} />
-            <Field label="평단가($)" value={h.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
-            <Field label="현재가($)" value={h.price} onChange={(v) => onChange("price", v)} />
+            <Field label={`평단가(${sym})`} value={h.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
+            <Field label={`현재가(${sym})`} value={h.price} onChange={(v) => onChange("price", v)} />
           </div>
           <div className="grid grid-cols-2 gap-2 mt-2">
-            <Field label="52주 고가($)" value={h.high52} onChange={(v) => onChange("high52", v)} />
+            <Field label={`52주 고가(${sym})`} value={h.high52} onChange={(v) => onChange("high52", v)} />
             <Field label="목표수량(주/개)" value={h.targetQty || 0} onChange={(v) => onChange("targetQty", v)} />
           </div>
 
@@ -851,10 +733,10 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
           <div className="mt-1" style={{ color: "#4A535C", fontSize: "9px" }}>고점 대비 하락률 기준 · 0 입력 시 해당 트리거 미사용</div>
 
           <div className="grid grid-cols-2 gap-2 mt-2">
-            <Field label="연배당($/주)" value={h.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
+            <Field label={`연배당(${sym}/주)`} value={h.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
             <div>
               <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
-              <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(h.qty * (h.divPerShare || 0))}</div>
+              <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtCurrency(h.qty * (h.divPerShare || 0), h.isKRW)}</div>
             </div>
           </div>
 
@@ -866,7 +748,7 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
               </div>
               {h.qty > 0 && h.avgPrice > 0 && (
                 <div className="mono mt-0.5" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
-                  수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
+                  수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtCurrency(prf, h.isKRW)})
                 </div>
               )}
             </div>
@@ -883,7 +765,7 @@ function HoldingCard({ h, expanded, onToggle, onChange, onDelete, onRefresh, bus
                 <div className="h-1.5 rounded-full" style={{ width: `${targetProgress}%`, background: remainingQty <= 0 ? "#3DDC97" : "#4FD1C5" }} />
               </div>
               <div className="mono" style={{ color: remainingQty <= 0 ? "#3DDC97" : "#B8C1CA", fontSize: "12px" }}>
-                {remainingQty <= 0 ? "✅ 수량 목표 달성!" : `목표까지 ${remainingQty}주 남음 (약 ${fmtUSD(remainingAmount)} 필요)`}
+                {remainingQty <= 0 ? "✅ 수량 목표 달성!" : `목표까지 ${remainingQty}주 남음 (약 ${fmtCurrency(remainingAmount, h.isKRW)} 필요)`}
               </div>
             </div>
           )}
@@ -898,6 +780,7 @@ function Phase2Card({ p, onChange, onRefresh, busy, refreshDisabled, weightPct }
   const d = dropPct(p);
   const yld = calcYield(p);
   const prf = calcProfit(p);
+  const sym = p.isKRW ? "₩" : "$";
   return (
     <div className="panel rounded-lg p-4">
       <div className="flex items-start justify-between">
@@ -914,36 +797,38 @@ function Phase2Card({ p, onChange, onRefresh, busy, refreshDisabled, weightPct }
       </div>
       <div className="grid grid-cols-3 gap-2 mt-3">
         <Field label="수량" value={p.qty} onChange={(v) => onChange("qty", v)} />
-        <Field label="평단가($)" value={p.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
-        <Field label="현재가($)" value={p.price} onChange={(v) => onChange("price", v)} />
+        <Field label={`평단가(${sym})`} value={p.avgPrice || 0} onChange={(v) => onChange("avgPrice", v)} />
+        <Field label={`현재가(${sym})`} value={p.price} onChange={(v) => onChange("price", v)} />
       </div>
       <div className="grid grid-cols-2 gap-2 mt-2">
-        <Field label="연배당($/주)" value={p.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
+        <Field label={`연배당(${sym}/주)`} value={p.divPerShare || 0} onChange={(v) => onChange("divPerShare", v)} />
         <div>
           <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>예상 연배당</div>
-          <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtUSD(p.qty * (p.divPerShare || 0))}</div>
+          <div className="mono text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#60A5FA" }}>{fmtCurrency(p.qty * (p.divPerShare || 0), p.isKRW)}</div>
         </div>
       </div>
       <div className="flex justify-between items-center mt-3 pt-3" style={{ borderTop: "1px solid #1F262D" }}>
         <div>
           {p.qty > 0 && p.avgPrice > 0 && (
             <div className="mono" style={{ color: yld >= 0 ? "#3DDC97" : "#FF5C5C", fontSize: "12px" }}>
-              수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtUSD(prf)})
+              수익 {yld >= 0 ? "+" : ""}{yld.toFixed(1)}% ({fmtCurrency(prf, p.isKRW)})
             </div>
           )}
           <div className="mono mt-0.5" style={{ color: "#8B96A5", fontSize: "11px" }}>비중 {(weightPct || 0).toFixed(1)}%</div>
         </div>
-        <div className="mono text-sm font-bold">{fmtUSD(value)}</div>
+        <div className="mono text-sm font-bold">{fmtCurrency(value, p.isKRW)}</div>
       </div>
     </div>
   );
 }
 
+// 🛡️ 보완: 디바운스 속도 단축 (350ms -> 200ms) 및 자동추천 UI 스타일 개선
 function AddHoldingForm({ onAdd, onCancel }) {
   const [ticker, setTicker] = useState("");
   const [name, setName] = useState("");
   const [category, setCategory] = useState("core");
   const [isCrypto, setIsCrypto] = useState(false);
+  const [isKRW, setIsKRW] = useState(false);
   const [qty, setQty] = useState(0);
   const [avgPrice, setAvgPrice] = useState(0);
   const [price, setPrice] = useState(0);
@@ -963,7 +848,6 @@ function AddHoldingForm({ onAdd, onCancel }) {
   const searchTimer = useRef(null);
 
   useEffect(() => {
-    // 코인 모드에서는 주식 심볼 검색을 띄우지 않음
     if (isCrypto || ticker.trim().length < 1) { setSuggestions([]); setShowSuggestions(false); return; }
     if (searchTimer.current) clearTimeout(searchTimer.current);
     searchTimer.current = setTimeout(async () => {
@@ -972,13 +856,14 @@ function AddHoldingForm({ onAdd, onCancel }) {
         const list = await apiSearch(ticker);
         setSuggestions(list);
         setShowSuggestions(list.length > 0);
-      } catch (e) {
-      } finally {
-        setSearching(false);
-      }
-    }, 350);
+      } catch (e) {} finally { setSearching(false); }
+    }, 200); // 🚀 반응 속도 개선
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
   }, [ticker, isCrypto]);
+
+  useEffect(() => {
+    if (ticker.endsWith(".KS") || ticker.endsWith(".KQ")) setIsKRW(true);
+  }, [ticker]);
 
   async function selectSuggestion(item) {
     setTicker(item.symbol);
@@ -989,6 +874,9 @@ function AddHoldingForm({ onAdd, onCancel }) {
     setNote("");
     setAutoFilling(true);
     try {
+      var isKorean = item.symbol.endsWith(".KS") || item.symbol.endsWith(".KQ");
+      if (isKorean) setIsKRW(true);
+      
       const q = await apiQuote(item.symbol).catch(() => null);
       if (q) {
         setPrice(q.price);
@@ -1008,23 +896,14 @@ function AddHoldingForm({ onAdd, onCancel }) {
   async function fillCryptoPrice() {
     const t = ticker.trim().toUpperCase();
     if (!t) return;
-    if (!CRYPTO_IDS[t]) {
-      setNote("자동 시세 미지원 코인이에요 · 직접 입력 (지원: " + SUPPORTED_COINS_LABEL + ")");
-      return;
-    }
-    setAutoFilling(true);
-    setNote("");
+    if (!CRYPTO_IDS[t]) { setNote("자동 시세 미지원 코인이에요 · 직접 입력 (지원: " + SUPPORTED_COINS_LABEL + ")"); return; }
+    setAutoFilling(true); setNote("");
     try {
       const prices = await apiCryptoPrices([t]);
       if (prices[t] == null) throw new Error("no price");
-      setPrice(prices[t]);
-      setHigh52((prev) => Math.max(prev, prices[t]));
+      setPrice(prices[t]); setHigh52((prev) => Math.max(prev, prices[t]));
       setAutoFilled(true);
-    } catch (e) {
-      setNote("코인 시세 조회 실패 — 직접 입력해 주세요");
-    } finally {
-      setAutoFilling(false);
-    }
+    } catch (e) { setNote("코인 시세 조회 실패 — 직접 입력해 주세요"); } finally { setAutoFilling(false); }
   }
 
   return (
@@ -1032,18 +911,26 @@ function AddHoldingForm({ onAdd, onCancel }) {
       <div className="grid grid-cols-2 gap-2">
         <div className="relative">
           <div className="mb-1" style={{ color: "#5C666F", fontSize: "10px" }}>티커 {!isCrypto && <span style={{ color: "#4A535C" }}>· 몇 글자만 입력하면 자동 검색돼요</span>}</div>
-          <input
-            value={ticker}
-            onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }}
-            onFocus={() => setShowSuggestions(suggestions.length > 0)}
-            onBlur={() => setTimeout(() => setShowSuggestions(false), 150)}
-            className="tinput mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
+          <input value={ticker} onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }} onFocus={() => setShowSuggestions(suggestions.length > 0)} onBlur={() => setTimeout(() => setShowSuggestions(false), 150)} className="tinput mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
           {searching && <div style={{ position: "absolute", right: 8, top: 30, fontSize: "10px", color: "#5C666F" }}>검색중</div>}
+          
+          {/* 🛡️ 보완: UI 및 가독성 개선된 자동완성 목록 */}
           {showSuggestions && (
-            <div className="absolute z-10 w-full mt-1 rounded-md" style={{ background: "#0B0E11", border: "1px solid #1F262D", maxHeight: "180px", overflowY: "auto" }}>
-              {suggestions.map((s) => (
-                <button key={s.symbol} type="button" onClick={() => selectSuggestion(s)} className="w-full text-left px-2 py-2 hover:bg-gray-800" style={{ fontSize: "11px", color: "#E8ECEF", borderBottom: "1px solid #1F262D" }}>
-                  <span className="mono font-bold">{s.symbol}</span> <span style={{ color: "#8B96A5" }}>{s.description}</span>
+            <div className="absolute z-20 w-[140%] mt-1 rounded-md overflow-hidden" 
+                 style={{ 
+                   background: "rgba(15, 23, 31, 0.95)", 
+                   backdropFilter: "blur(10px)",
+                   border: "1px solid #2B3544", 
+                   maxHeight: "220px", 
+                   overflowY: "auto",
+                   boxShadow: "0 10px 25px rgba(0,0,0,0.6)"
+                 }}>
+              {suggestions.map((s, index) => (
+                <button key={s.symbol} type="button" onClick={() => selectSuggestion(s)} 
+                        className="w-full text-left px-3 py-2.5 hover:bg-[#162B29] transition-colors duration-150" 
+                        style={{ fontSize: "11px", color: "#E8ECEF", borderBottom: index < suggestions.length - 1 ? "1px solid #252F3A" : "none" }}>
+                  <span className="mono font-bold text-[#4FD1C5]">{s.symbol}</span> 
+                  <span className="ml-1" style={{ color: "#8B96A5" }}>{s.description}</span>
                 </button>
               ))}
             </div>
@@ -1059,11 +946,11 @@ function AddHoldingForm({ onAdd, onCancel }) {
       {note && !autoFilling && <div style={{ color: "#FFB020", fontSize: "11px" }}>{note}</div>}
       <div className="grid grid-cols-3 gap-2">
         <Field label="수량" value={qty} onChange={setQty} />
-        <Field label="평단가($)" value={avgPrice} onChange={setAvgPrice} />
-        <Field label="현재가($)" value={price} onChange={setPrice} />
+        <Field label={`평단가(${isKRW ? '₩' : '$'})`} value={avgPrice} onChange={setAvgPrice} />
+        <Field label={`현재가(${isKRW ? '₩' : '$'})`} value={price} onChange={setPrice} />
       </div>
       <div className="grid grid-cols-2 gap-2">
-        <Field label="52주 고가($)" value={high52} onChange={setHigh52} />
+        <Field label={`52주 고가(${isKRW ? '₩' : '$'})`} value={high52} onChange={setHigh52} />
         <Field label="목표수량(주/개)" value={targetQty} onChange={setTargetQty} />
       </div>
       <div className="grid grid-cols-3 gap-2 pt-2" style={{ borderTop: "1px dashed #1F262D" }}>
@@ -1071,13 +958,16 @@ function AddHoldingForm({ onAdd, onCancel }) {
         <Field label="2차 트리거(%)" negative value={t2} onChange={setT2} />
         <Field label="과거 MDD(%)" negative value={mdd} onChange={setMdd} />
       </div>
-      <Field label="연배당($/주)" value={divPerShare} onChange={setDivPerShare} />
+      <Field label={`연배당(${isKRW ? '₩' : '$'}/주)`} value={divPerShare} onChange={setDivPerShare} />
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-1.5" style={{ color: "#B8C1CA", fontSize: "12px" }}>
           <input type="checkbox" checked={category === "satellite"} onChange={(e) => setCategory(e.target.checked ? "satellite" : "core")} /> 위성자산
         </label>
         <label className="flex items-center gap-1.5" style={{ color: "#B8C1CA", fontSize: "12px" }}>
           <input type="checkbox" checked={isCrypto} onChange={(e) => { setIsCrypto(e.target.checked); setNote(""); }} /> 코인
+        </label>
+        <label className="flex items-center gap-1.5" style={{ color: "#B8C1CA", fontSize: "12px" }}>
+          <input type="checkbox" checked={isKRW} onChange={(e) => { setIsKRW(e.target.checked); setNote(""); }} /> 국내 상장(KRW)
         </label>
         {isCrypto && (
           <button type="button" onClick={fillCryptoPrice} disabled={autoFilling} className="px-2 py-1 rounded hover:bg-gray-800" style={{ background: "#1A2027", color: "#4FD1C5", fontSize: "11px", border: "1px solid #1F262D" }}>
@@ -1086,8 +976,7 @@ function AddHoldingForm({ onAdd, onCancel }) {
         )}
       </div>
       <div className="flex gap-2 pt-1">
-        <button onClick={() => { if (ticker) onAdd({ ticker: ticker.trim().toUpperCase(), name: name || ticker, category, isCrypto, qty, avgPrice, price, high52, targetQty, t1, t2, mdd, divPerShare }); }}
-          className="flex-1 py-2.5 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>추가</button>
+        <button onClick={() => { if (ticker) onAdd({ ticker: ticker.trim().toUpperCase(), name: name || ticker, category, isCrypto, isKRW, qty, avgPrice, price, high52, targetQty, t1, t2, mdd, divPerShare }); }} className="flex-1 py-2.5 rounded-md font-bold hover:bg-teal-400" style={{ background: "#4FD1C5", color: "#0B0E11", fontSize: "12px" }}>추가</button>
         <button onClick={onCancel} className="flex-1 py-2.5 rounded-md hover:bg-gray-800" style={{ background: "#1A2027", color: "#8B96A5", fontSize: "12px" }}>취소</button>
       </div>
     </div>
@@ -1159,7 +1048,6 @@ function SettingsModal({ onClose, exchangeRate, onRateChange, onFetchFx, fxBusy,
 }
 
 // ═══ [8] APP ════════════════════════════════════════════════════════
-// 상태 보관 + 저장 + 시세 오케스트레이션만 담당. 화면은 [7]의 컴포넌트로 위임.
 
 function PortfolioConsole() {
   const [holdings, setHoldings] = useState(() => DEFAULT_HOLDINGS.map((h) => Object.assign({}, h)));
@@ -1177,8 +1065,8 @@ function PortfolioConsole() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [lastSaved, setLastSaved] = useState(null);
   const [saveError, setSaveError] = useState(false);
-  const [busyKey, setBusyKey] = useState(null);      // 개별 갱신 중인 자산 id
-  const [bulk, setBulk] = useState(null);            // 전체 갱신 진행률 {done,total} | null
+  const [busyKey, setBusyKey] = useState(null);
+  const [bulk, setBulk] = useState(null);
   const [fxBusy, setFxBusy] = useState(false);
   const [hasRefreshedThisSession, setHasRefreshedThisSession] = useState(false);
   const [expandedIds, setExpandedIds] = useState({});
@@ -1189,7 +1077,6 @@ function PortfolioConsole() {
   const bilCardRef = useRef(null);
   const toastSeq = useRef(0);
 
-  // ── 토스트 ──
   const removeToast = useCallback((id) => setToasts((p) => p.filter((t) => t.id !== id)), []);
   const toast = useCallback((type, msg, ms) => {
     var id = ++toastSeq.current;
@@ -1198,7 +1085,6 @@ function PortfolioConsole() {
     setTimeout(function () { removeToast(id); }, life);
   }, [removeToast]);
 
-  // ── 불러오기 (v6 → v7 자동 이전 포함) ──
   useEffect(() => {
     var res = loadPersistedState();
     if (res) {
@@ -1212,12 +1098,11 @@ function PortfolioConsole() {
       setLastPriceSync(st.lastPriceSync);
       setLastBackupAt(st.lastBackupAt);
       if (st.lastUpdated) setLastSaved(st.lastUpdated);
-      if (res.migrated) toast("info", "기존 데이터를 새 버전(v7)으로 옮겨왔어요");
+      if (res.migrated) toast("info", "기존 데이터를 새 버전(v8)으로 옮겨왔어요");
     }
     setLoaded(true);
   }, []);
 
-  // ── 자동 저장 (0.7초 디바운스) ──
   useEffect(() => {
     if (!loaded) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -1234,8 +1119,6 @@ function PortfolioConsole() {
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
   }, [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt, loaded]);
 
-  // ── 자산 수정/추가/삭제 ──
-  // 현재가 수정 시 52주 고가를 자동 상향하는 규칙을 1·2단계가 공유
   const makeFieldUpdater = (setList) => (id, field, v) => {
     setList((prev) => prev.map((x) => {
       if (x.id !== id) return x;
@@ -1274,7 +1157,6 @@ function PortfolioConsole() {
     if (bilCardRef.current) bilCardRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
-  // ── 시세 갱신 ──
   function applyToList(scope, id, q) {
     var upd = (list) => list.map((x) => (x.id === id ? applyQuoteToAsset(x, q) : x));
     if (scope === "holding") setHoldings(upd);
@@ -1325,7 +1207,6 @@ function PortfolioConsole() {
     }
   }
 
-  // 전체 갱신: 환율 → 코인(1회 일괄) → 주식(순차) 순서로 진행률 표시
   async function refreshAllPrices() {
     if (bulk) return;
     if (underCooldown("bulk", COOLDOWN_MS.bulk)) {
@@ -1337,12 +1218,13 @@ function PortfolioConsole() {
     var cryptoTickers = [];
     holdings.forEach((h) => { if (h.isCrypto && cryptoTickers.indexOf(h.ticker) === -1) cryptoTickers.push(h.ticker); });
 
-    var total = stockTargets.length + (cryptoTickers.length ? 1 : 0) + 1; // +1 = 환율
+    var total = stockTargets.length + (cryptoTickers.length ? 1 : 0) + 1;
     setBulk({ done: 0, total: total });
     var failed = [];
     var step = () => setBulk((b) => (b ? { done: b.done + 1, total: b.total } : b));
 
-    try { setExchangeRate(await apiFxKRW()); } catch (e) { failed.push("환율"); }
+    var currentFx = exchangeRate;
+    try { currentFx = await apiFxKRW(); setExchangeRate(currentFx); } catch (e) { failed.push("환율"); }
     step();
 
     if (cryptoTickers.length) {
@@ -1392,9 +1274,6 @@ function PortfolioConsole() {
     }
   }
 
-  // ── 백업 / 복원 / 초기화 ──
-  // 내보내기는 localStorage가 아닌 "현재 화면의 상태"를 직렬화합니다.
-  // (저장 디바운스 0.7초 사이의 최신 수정분 누락 버그 수정)
   function handleExportData() {
     try {
       var payload = serializeState({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals, lastPriceSync, lastBackupAt });
@@ -1455,11 +1334,7 @@ function PortfolioConsole() {
     toast("success", "전체 데이터를 초기화했어요");
   }
 
-  // ── 파생 상태 ──
-  const summary = useMemo(
-    () => computeSummary({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals }),
-    [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals]
-  );
+  const summary = useMemo(() => computeSummary({ holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals }), [holdings, phase2, bilBalance, exchangeRate, bilMinPct, goals]);
   const priceStale = lastPriceSync && isStale(lastPriceSync, 20);
   const needsInitialSync = !hasRefreshedThisSession && isStale(lastPriceSync, 1);
   const backupStale = !lastBackupAt || isStale(lastBackupAt, 24 * 30);
@@ -1478,15 +1353,9 @@ function PortfolioConsole() {
         .tinput:focus { border-color: #4FD1C5 !important; }
         ::-webkit-scrollbar { width: 4px; height: 4px; }
         ::-webkit-scrollbar-thumb { background: #1F262D; border-radius: 2px; }
-        @keyframes pulseGlow {
-          0%, 100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.45); }
-          50% { box-shadow: 0 0 0 10px rgba(79, 209, 197, 0); }
-        }
+        @keyframes pulseGlow { 0%, 100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.45); } 50% { box-shadow: 0 0 0 10px rgba(79, 209, 197, 0); } }
         .pulse-cta { animation: pulseGlow 1.8s ease-in-out infinite; }
-        @keyframes toastIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
+        @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         .toast-item { animation: toastIn 0.18s ease-out; }
       `}</style>
 
@@ -1517,12 +1386,9 @@ function PortfolioConsole() {
 
       <div className="max-w-3xl mx-auto px-4 pt-5 space-y-5">
         {needsInitialSync && (
-          <button onClick={refreshAllPrices} disabled={!!bulk} className="w-full rounded-lg p-4 flex items-center justify-center gap-2 pulse-cta"
-            style={{ background: "#132A28", border: "1px solid #4FD1C5" }}>
+          <button onClick={refreshAllPrices} disabled={!!bulk} className="w-full rounded-lg p-4 flex items-center justify-center gap-2 pulse-cta" style={{ background: "#132A28", border: "1px solid #4FD1C5" }}>
             <RefreshCw size={18} color="#4FD1C5" className={bulk ? "animate-spin" : ""} />
-            <span style={{ color: "#4FD1C5", fontSize: "13px", fontWeight: "bold" }}>
-              {bulk ? "최신 시세 불러오는 중... " + bulk.done + "/" + bulk.total : "시작 전, 최신 시세로 한 번 갱신하기"}
-            </span>
+            <span style={{ color: "#4FD1C5", fontSize: "13px", fontWeight: "bold" }}>{bulk ? "최신 시세 불러오는 중... " + bulk.done + "/" + bulk.total : "시작 전, 최신 시세로 한 번 갱신하기"}</span>
           </button>
         )}
 
@@ -1533,9 +1399,7 @@ function PortfolioConsole() {
         )}
 
         <ActionPanel summary={summary} onJumpHolding={jumpToHolding} onJumpBil={jumpToBil} />
-
         <SummaryPanel summary={summary} goals={goals} />
-
         <AllocationPanel summary={summary} holdings={holdings} phase2={phase2} bilBalance={bilBalance} />
 
         <div>
@@ -1551,17 +1415,7 @@ function PortfolioConsole() {
           <div className="space-y-2">
             {holdings.map((h) => (
               <HoldingCard
-                key={h.id}
-                h={h}
-                expanded={!!expandedIds[h.id]}
-                onToggle={() => toggleExpand(h.id)}
-                onChange={(field, v) => changeHolding(h.id, field, v)}
-                onDelete={() => removeHoldingById(h.id)}
-                onRefresh={() => refreshAsset(h, "holding")}
-                busy={busyKey === h.id}
-                refreshDisabled={!!bulk}
-                weightPct={summary.weights[h.id]}
-                registerRef={(el) => { cardRefs.current[h.id] = el; }}
+                key={h.id} h={h} expanded={!!expandedIds[h.id]} onToggle={() => toggleExpand(h.id)} onChange={(field, v) => changeHolding(h.id, field, v)} onDelete={() => removeHoldingById(h.id)} onRefresh={() => refreshAsset(h, "holding")} busy={busyKey === h.id} refreshDisabled={!!bulk} weightPct={summary.weights[h.id]} registerRef={(el) => { cardRefs.current[h.id] = el; }}
               />
             ))}
           </div>
@@ -1570,25 +1424,16 @@ function PortfolioConsole() {
         <div>
           <div className="flex items-center justify-between mb-2">
             <div className="text-sm font-bold">2단계 · SCHD·SCHG (배당·성장 코어)</div>
-            <div style={{ color: "#8B96A5", fontSize: "11px" }}>{fmtUSD(summary.phase2ValueUSD)}</div>
+            <div style={{ color: "#8B96A5", fontSize: "11px" }}>{fmtCurrency(summary.phase2ValueUSD, false)}</div>
           </div>
           <div className="space-y-2">
             {phase2.map((p) => (
-              <Phase2Card
-                key={p.id}
-                p={p}
-                onChange={(field, v) => changePhase2(p.id, field, v)}
-                onRefresh={() => refreshAsset(p, "phase2")}
-                busy={busyKey === p.id}
-                refreshDisabled={!!bulk}
-                weightPct={summary.weights[p.id]}
-              />
+              <Phase2Card key={p.id} p={p} onChange={(field, v) => changePhase2(p.id, field, v)} onRefresh={() => refreshAsset(p, "phase2")} busy={busyKey === p.id} refreshDisabled={!!bulk} weightPct={summary.weights[p.id]} />
             ))}
           </div>
         </div>
 
         <BilCard innerRef={bilCardRef} bilBalance={bilBalance} onChange={setBilBalance} summary={summary} bilMinPct={bilMinPct} />
-
         <RulesPanel open={showRules} onToggle={() => setShowRules((s) => !s)} />
 
         <div className="text-center pt-2 pb-4" style={{ color: "#4A535C", fontSize: "11px" }}>
@@ -1599,22 +1444,7 @@ function PortfolioConsole() {
       </div>
 
       {showSettings && (
-        <SettingsModal
-          onClose={() => setShowSettings(false)}
-          exchangeRate={exchangeRate}
-          onRateChange={setExchangeRate}
-          onFetchFx={fetchFx}
-          fxBusy={fxBusy}
-          bilMinPct={bilMinPct}
-          onBilMinChange={setBilMinPct}
-          goals={goals}
-          onGoalsChange={setGoals}
-          onExport={handleExportData}
-          onImportFile={handleImportData}
-          lastBackupAt={lastBackupAt}
-          backupStale={backupStale}
-          onResetAll={handleResetAll}
-        />
+        <SettingsModal onClose={() => setShowSettings(false)} exchangeRate={exchangeRate} onRateChange={setExchangeRate} onFetchFx={fetchFx} fxBusy={fxBusy} bilMinPct={bilMinPct} onBilMinChange={setBilMinPct} goals={goals} onGoalsChange={setGoals} onExport={handleExportData} onImportFile={handleImportData} lastBackupAt={lastBackupAt} backupStale={backupStale} onResetAll={handleResetAll} />
       )}
 
       <ToastHost toasts={toasts} onClose={removeToast} />
