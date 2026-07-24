@@ -75,7 +75,6 @@ const STORAGE_KEY = "portfolio-data-v8";
 const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
 
 const PROXY_URL = "https://finnhub-proxy.seowonhaha.workers.dev";
-// Cloudflare Worker의 CLIENT_SECRET과 반드시 동일한 값으로 바꿔주세요.
 const CLIENT_KEY = "1639a4b7aff5f79e5b199673a1be278773127eea3490c344";
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price";
 const FX_URL = "https://open.er-api.com/v6/latest/USD";
@@ -829,7 +828,6 @@ function Phase2Card({ p, onChange, onRefresh, busy, refreshDisabled, weightPct }
   );
 }
 
-// 🛡️ 보완: 디바운스 속도 단축 (350ms -> 200ms) 및 자동추천 UI 스타일 개선
 function AddHoldingForm({ onAdd, onCancel }) {
   const [ticker, setTicker] = useState("");
   const [name, setName] = useState("");
@@ -864,7 +862,7 @@ function AddHoldingForm({ onAdd, onCancel }) {
         setSuggestions(list);
         setShowSuggestions(list.length > 0);
       } catch (e) {} finally { setSearching(false); }
-    }, 200); // 🚀 반응 속도 개선
+    }, 200); 
     return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
   }, [ticker, isCrypto]);
 
@@ -921,7 +919,6 @@ function AddHoldingForm({ onAdd, onCancel }) {
           <input value={ticker} onChange={(e) => { setTicker(e.target.value.toUpperCase()); setAutoFilled(false); }} onFocus={() => setShowSuggestions(suggestions.length > 0)} onBlur={() => setTimeout(() => setShowSuggestions(false), 150)} className="tinput mono w-full text-sm rounded px-2 py-1.5" style={{ background: "#0B0E11", border: "1px solid #1F262D", color: "#E8ECEF" }} />
           {searching && <div style={{ position: "absolute", right: 8, top: 30, fontSize: "10px", color: "#5C666F" }}>검색중</div>}
           
-          {/* 🛡️ 보완: UI 및 가독성 개선된 자동완성 목록 */}
           {showSuggestions && (
             <div className="absolute z-20 w-[140%] mt-1 rounded-md overflow-hidden" 
                  style={{ 
