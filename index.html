@@ -75,6 +75,8 @@ const STORAGE_KEY = "portfolio-data-v8";
 const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
 
 const PROXY_URL = "https://finnhub-proxy.seowonhaha.workers.dev";
+// Cloudflare Worker의 CLIENT_SECRET과 반드시 동일한 값으로 바꿔주세요.
+const CLIENT_KEY = "REPLACE_WITH_YOUR_SECRET";
 const COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price";
 const FX_URL = "https://open.er-api.com/v6/latest/USD";
 
@@ -217,21 +219,26 @@ function underCooldown(key, ms) { return Date.now() - (__cooldowns[key] || 0) < 
 function markCooldown(key) { __cooldowns[key] = Date.now(); }
 function cooldownLeft(key, ms) { return Math.max(1, Math.ceil((ms - (Date.now() - (__cooldowns[key] || 0))) / 1000)); }
 
-async function fetchJson(url) {
-  var res = await fetch(url);
+async function fetchJson(url, options) {
+  var res = await fetch(url, options);
   if (!res.ok) throw new Error("HTTP " + res.status);
   return res.json();
 }
 
+// Worker 프록시 호출에만 붙이는 인증 헤더 (CoinGecko/환율 API에는 안 붙음)
+function proxyOpts() {
+  return { headers: { "X-Client-Key": CLIENT_KEY } };
+}
+
 async function apiQuote(ticker) {
-  var d = await fetchJson(PROXY_URL + "?endpoint=quote&symbol=" + encodeURIComponent(ticker));
+  var d = await fetchJson(PROXY_URL + "?endpoint=quote&symbol=" + encodeURIComponent(ticker), proxyOpts());
   if (!d || (d.c === 0 && d.h === 0)) throw new Error("no quote");
   return { price: d.c, dayHigh: d.h || 0 };
 }
 
 async function apiMetric(ticker) {
   try {
-    var d = await fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker));
+    var d = await fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker), proxyOpts());
     var m = d && d.metric;
     if (!m) return { div: null, high52: 0 };
     var div = typeof m.dividendPerShareTTM === "number" ? m.dividendPerShareTTM : (typeof m.dividendPerShareAnnual === "number" ? m.dividendPerShareAnnual : null);
@@ -241,7 +248,7 @@ async function apiMetric(ticker) {
 }
 
 async function apiSearch(q) {
-  var d = await fetchJson(PROXY_URL + "?endpoint=search&q=" + encodeURIComponent(q));
+  var d = await fetchJson(PROXY_URL + "?endpoint=search&q=" + encodeURIComponent(q), proxyOpts());
   var all = (d && d.result) || [];
   // 한국 주식/ETF 검색 지원을 위해 .KS(코스피) 및 .KQ(코스닥) 필터 통과 허용
   var filtered = all.filter(function (s) {
