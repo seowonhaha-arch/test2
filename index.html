@@ -64,7 +64,17 @@ window.addEventListener('load', function() {
 
 <script type="text/plain" id="app-src">
 // ════════════════════════════════════════════════════════════════════
-//  자산 관제 콘솔 · PF-12 (조회 안정화 + 캐시 기반 무료최적화 + UX 추가)
+//  자산 관제 콘솔 · PF-13 (동시요청 순차화로 429 방지 + 이전 최적화 유지)
+//
+//  [PF-13 변경사항]
+//  · 프록시 호출 큐 추가: 종목이 여러 개일 때 quote·metric 요청이 한꺼번에
+//    몰려 Finnhub 무료 플랜의 순간 한도(429)에 걸리던 문제를 해결.
+//    모든 프록시 호출(quote/kr_quote/metric/search)을 한 줄로 세워
+//    최소 1.1초 간격으로 순차 발사 → 종목 수가 늘어도 "동시에 쏟아지는"
+//    상황 자체가 생기지 않음. 전체갱신 시간은 다소 늘어나지만
+//    (7종목 기준 약 10~15초) 조회 실패율이 크게 줄어듦.
+//  · 전체갱신 루프의 불필요한 추가 지연(종목당 300ms) 제거 — 큐가 이미
+//    실제 페이싱을 담당하므로 중복 대기를 없애 체감 속도 개선.
 //
 //  [PF-12 변경사항]
 //  ① 조회 실패(안정성) 수정
@@ -90,7 +100,7 @@ window.addEventListener('load', function() {
 
 // ═══ [1] CONFIG ═════════════════════════════════════════════════════
 
-const APP_VERSION = "PF-12";
+const APP_VERSION = "PF-13";
 const SCHEMA_VERSION = 8;
 const STORAGE_KEY = "portfolio-data-v8";
 const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
@@ -257,6 +267,27 @@ function loadPersistedState() {
 
 // ═══ [4] MARKET API ═════════════════════════════════════════════════
 
+// ── 프록시 호출 큐 (PF-13): 여러 종목을 동시에 조회할 때 요청이 한꺼번에
+//    몰려서 Finnhub 무료 플랜의 순간 한도(429)에 걸리는 문제를 막기 위해,
+//    모든 프록시(quote/kr_quote/metric/search) 호출을 한 줄로 세워
+//    최소 간격(1.1초)을 두고 순차적으로 내보낸다. 종목 수가 많아도
+//    "동시에 쏟아지는 상황"이 원천적으로 발생하지 않는다.
+var __proxyChain = Promise.resolve();
+var __proxyLastCallAt = 0;
+var PROXY_MIN_GAP_MS = 1100;
+function scheduleProxyCall(fn) {
+  var run = __proxyChain.then(function () {
+    var wait = PROXY_MIN_GAP_MS - (Date.now() - __proxyLastCallAt);
+    return wait > 0 ? new Promise(function (r) { setTimeout(r, wait); }) : null;
+  }).then(function () {
+    __proxyLastCallAt = Date.now();
+    return fn();
+  });
+  // 이번 호출이 실패해도 대기열은 계속 흘러가야 다음 호출이 막히지 않음
+  __proxyChain = run.then(function () {}, function () {});
+  return run;
+}
+
 var __cooldowns = {};
 function underCooldown(key, ms) { return Date.now() - (__cooldowns[key] || 0) < ms; }
 function markCooldown(key) { __cooldowns[key] = Date.now(); }
@@ -348,7 +379,9 @@ async function apiQuote(ticker, isKRW) {
   var hit = memGet(ck, QUOTE_CACHE_MS);
   if (hit) return hit;
 
-  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&symbol=" + encodeURIComponent(ticker), proxyOpts());
+  var d = await scheduleProxyCall(function () {
+    return fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&symbol=" + encodeURIComponent(ticker), proxyOpts());
+  });
   if (!d) throw new Error("응답 없음");
 
   var out;
@@ -370,7 +403,9 @@ async function apiMetric(ticker) {
   var cache = getMetricCache();
   if (cache[ticker]) return cache[ticker];
   try {
-    var d = await fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker), proxyOpts());
+    var d = await scheduleProxyCall(function () {
+      return fetchJson(PROXY_URL + "?endpoint=metric&symbol=" + encodeURIComponent(ticker), proxyOpts());
+    });
     var m = d && d.metric;
     if (!m) {
       var empty = { div: null, high52: 0 };
@@ -393,7 +428,9 @@ async function apiSearch(q) {
   var hasKorean = /[ㄱ-ㅎㅏ-ㅣ가-힣]/.test(t);
   var looksLikeKrCode = /^\d{4,6}$/.test(t);
   var endpoint = (hasKorean || looksLikeKrCode) ? "kr_search" : "search";
-  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&q=" + encodeURIComponent(t), proxyOpts());
+  var d = await scheduleProxyCall(function () {
+    return fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&q=" + encodeURIComponent(t), proxyOpts());
+  });
   var all = (d && d.result) || [];
   if (endpoint === "search") {
     // Finnhub 무료는 미국 상장만 지원.
@@ -1266,7 +1303,7 @@ function SettingsModal({ onClose, exchangeRate, onRateChange, onFetchFx, fxBusy,
 
         <div className="pt-1 pb-2" style={{ borderBottom: "1px solid #1F262D" }}>
           <div style={{ color: "#3DDC97", fontSize: "12px", fontWeight: "bold" }}>🔒 Cloudflare 보안 프록시 v2 활성화됨</div>
-          <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 서버(Worker)에만 저장돼요. 시세는 60초, 배당·52주고가는 하루 단위로 캐시해서 무료 호출 한도를 아껴요. 일시적 오류는 자동 재시도돼요.</div>
+          <div style={{ color: "#8B96A5", fontSize: "11px", marginTop: "4px" }}>API Key는 서버(Worker)에만 저장돼요. 시세는 60초, 배당·52주고가는 하루 단위로 캐시하고, 모든 조회는 1.1초 간격으로 순차 처리해서 종목이 많아도 한도초과 없이 안정적으로 갱신돼요. 일시적 오류는 자동 재시도돼요.</div>
         </div>
 
         <div className="flex items-end gap-2">
@@ -1594,7 +1631,6 @@ function PortfolioConsole() {
         failed.push(tgt.ticker);
       }
       step();
-      await new Promise((res) => setTimeout(res, 300));
     }
 
     markCooldown("bulk");
