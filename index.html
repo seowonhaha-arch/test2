@@ -64,12 +64,12 @@ window.addEventListener('load', function() {
 
 <script type="text/plain" id="app-src">
 // ════════════════════════════════════════════════════════════════════
-//  자산 관제 콘솔 · PF-09 (자동완성 UI 개선 및 반응속도 최적화)
+//  자산 관제 콘솔 · PF-10 (국내외 API 완벽 분기 통합)
 // ════════════════════════════════════════════════════════════════════
 
 // ═══ [1] CONFIG ═════════════════════════════════════════════════════
 
-const APP_VERSION = "PF-09";
+const APP_VERSION = "PF-10";
 const SCHEMA_VERSION = 8;
 const STORAGE_KEY = "portfolio-data-v8";
 const LEGACY_STORAGE_KEYS = ["portfolio-data-v7", "portfolio-data-v6"];
@@ -88,11 +88,9 @@ const CASH_COLOR = "#3B82F6";
 const CATEGORY_COLORS = { core: "#4FD1C5", satellite: "#FFB020", phase2: "#B18CFF", cash: CASH_COLOR };
 const STATUS_META = { normal: { label: "정상", color: "#3DDC97" }, t1: { label: "2배 매수", color: "#FFB020" }, t2: { label: "BIL 집행", color: "#FF5C5C" }, done: { label: "목표 달성", color: "#60A5FA" } };
 
-// 국내 주식 확장을 위한 isKRW 속성 추가
 const HOLDING_DEFAULTS = { category: "core", isCrypto: false, isKRW: false, qty: 0, avgPrice: 0, price: 0, high52: 0, targetQty: 0, t1: -15, t2: -30, mdd: 0, divPerShare: 0 };
 const PHASE2_DEFAULTS = { isKRW: false, qty: 0, avgPrice: 0, price: 0, high52: 0, divPerShare: 0 };
 
-// 첫 사용자 온보딩을 위해 테슬라와 비트코인만 예시로 남김
 const DEFAULT_HOLDINGS = [
   { id: "h1", ticker: "TSLA", name: "테슬라", category: "core", isCrypto: false, isKRW: false, qty: 0, avgPrice: 0, price: 400, high52: 463, targetQty: 100, t1: -25, t2: -40, mdd: -74, divPerShare: 0 },
   { id: "h2", ticker: "BTC", name: "비트코인", category: "satellite", isCrypto: true, isKRW: false, qty: 0, avgPrice: 0, price: 66509, high52: 124000, targetQty: 1, t1: -25, t2: -40, mdd: -84, divPerShare: 0 }
@@ -224,15 +222,24 @@ async function fetchJson(url, options) {
   return res.json();
 }
 
-// Worker 프록시 호출에만 붙이는 인증 헤더 (CoinGecko/환율 API에는 안 붙음)
 function proxyOpts() {
   return { headers: { "X-Client-Key": CLIENT_KEY } };
 }
 
-async function apiQuote(ticker) {
-  var d = await fetchJson(PROXY_URL + "?endpoint=quote&symbol=" + encodeURIComponent(ticker), proxyOpts());
-  if (!d || (d.c === 0 && d.h === 0)) throw new Error("no quote");
-  return { price: d.c, dayHigh: d.h || 0 };
+async function apiQuote(ticker, isKRW) {
+  var isKr = isKRW || ticker.endsWith(".KS") || ticker.endsWith(".KQ");
+  var endpoint = isKr ? "kr_quote" : "quote";
+
+  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&symbol=" + encodeURIComponent(ticker), proxyOpts());
+  if (!d) throw new Error("no quote");
+
+  if (isKr) {
+    if (typeof d.c !== "number" || isNaN(d.c)) throw new Error("KIS no quote");
+    return { price: d.c, dayHigh: d.h || 0, high52: d.w52h || 0 };
+  } else {
+    if (typeof d.c !== "number" || (d.c === 0 && d.h === 0)) throw new Error("Finnhub no quote");
+    return { price: d.c, dayHigh: d.h || 0, high52: 0 };
+  }
 }
 
 async function apiMetric(ticker) {
@@ -247,14 +254,11 @@ async function apiMetric(ticker) {
 }
 
 async function apiSearch(q) {
-  var d = await fetchJson(PROXY_URL + "?endpoint=search&q=" + encodeURIComponent(q), proxyOpts());
+  var hasKorean = /[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]/.test(q);
+  var endpoint = hasKorean ? "kr_search" : "search";
+  var d = await fetchJson(PROXY_URL + "?endpoint=" + endpoint + "&q=" + encodeURIComponent(q), proxyOpts());
   var all = (d && d.result) || [];
-  // 한국 주식/ETF 검색 지원을 위해 .KS(코스피) 및 .KQ(코스닥) 필터 통과 허용
-  var filtered = all.filter(function (s) {
-    if (!s.symbol) return false;
-    return s.symbol.indexOf(".") === -1 || s.symbol.endsWith(".KS") || s.symbol.endsWith(".KQ");
-  });
-  return (filtered.length ? filtered : all).slice(0, 6);
+  return all.slice(0, 6);
 }
 
 async function apiCryptoPrices(tickers) {
@@ -298,7 +302,6 @@ function computeSummary(s) {
   var holdings = s.holdings, phase2 = s.phase2, bilBalance = s.bilBalance;
   var exchangeRate = s.exchangeRate, bilMinPct = s.bilMinPct, goals = s.goals;
 
-  // 모든 가치 계산 시 한국 주식(isKRW)은 환율을 나누어 달러(USD) 장부로 일원화
   var phase1TargetUSD = holdings.reduce(function (sum, h) { return sum + toUSD((h.targetQty || 0) * h.price, h.isKRW, exchangeRate); }, 0);
   var phase1CurrentUSD = holdings.reduce(function (sum, h) { return sum + toUSD(h.qty * h.price, h.isKRW, exchangeRate); }, 0);
   var phase1Progress = phase1TargetUSD > 0 ? Math.min(100, (phase1CurrentUSD / phase1TargetUSD) * 100) : 0;
@@ -882,10 +885,10 @@ function AddHoldingForm({ onAdd, onCancel }) {
       var isKorean = item.symbol.endsWith(".KS") || item.symbol.endsWith(".KQ");
       if (isKorean) setIsKRW(true);
       
-      const q = await apiQuote(item.symbol).catch(() => null);
+      const q = await apiQuote(item.symbol, isKorean).catch(() => null);
       if (q) {
         setPrice(q.price);
-        setHigh52(Math.max(q.price, q.dayHigh || 0));
+        setHigh52(Math.max(q.price, q.dayHigh || 0, q.high52 || 0));
       }
       const m = await apiMetric(item.symbol);
       if (m.div != null) setDivPerShare(m.div);
@@ -1102,7 +1105,7 @@ function PortfolioConsole() {
       setLastPriceSync(st.lastPriceSync);
       setLastBackupAt(st.lastBackupAt);
       if (st.lastUpdated) setLastSaved(st.lastUpdated);
-      if (res.migrated) toast("info", "기존 데이터를 새 버전(v8)으로 옮겨왔어요");
+      if (res.migrated) toast("info", "기존 데이터를 새 버전으로 옮겨왔어요");
     }
     setLoaded(true);
   }, []);
@@ -1193,6 +1196,7 @@ function PortfolioConsole() {
       }
       return;
     }
+    
     var skey = "stock:" + asset.ticker;
     if (underCooldown(skey, COOLDOWN_MS.stock)) {
       toast("info", asset.ticker + " 재조회는 " + cooldownLeft(skey, COOLDOWN_MS.stock) + "초 후에 가능해요");
@@ -1200,8 +1204,14 @@ function PortfolioConsole() {
     }
     setBusyKey(asset.id);
     try {
-      var results = await Promise.all([apiQuote(asset.ticker), apiMetric(asset.ticker)]);
-      applyToList(scope, asset.id, { price: results[0].price, dayHigh: results[0].dayHigh, metricHigh: results[1].high52, div: results[1].div });
+      var isKr = asset.isKRW || asset.ticker.endsWith(".KS") || asset.ticker.endsWith(".KQ");
+      if (isKr) {
+        var q = await apiQuote(asset.ticker, true);
+        applyToList(scope, asset.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null });
+      } else {
+        var results = await Promise.all([apiQuote(asset.ticker, false), apiMetric(asset.ticker)]);
+        applyToList(scope, asset.id, { price: results[0].price, dayHigh: results[0].dayHigh, metricHigh: results[1].high52, div: results[1].div });
+      }
       markCooldown(skey);
       setLastPriceSync(new Date().toISOString());
     } catch (e) {
@@ -1217,8 +1227,8 @@ function PortfolioConsole() {
       toast("info", "전체 갱신은 " + cooldownLeft("bulk", COOLDOWN_MS.bulk) + "초 후에 다시 가능해요");
       return;
     }
-    var stockTargets = holdings.filter((h) => !h.isCrypto).map((h) => ({ scope: "holding", id: h.id, ticker: h.ticker }))
-      .concat(phase2.map((p) => ({ scope: "phase2", id: p.id, ticker: p.ticker })));
+    var stockTargets = holdings.filter((h) => !h.isCrypto).map((h) => ({ scope: "holding", id: h.id, ticker: h.ticker, isKRW: h.isKRW }))
+      .concat(phase2.map((p) => ({ scope: "phase2", id: p.id, ticker: p.ticker, isKRW: p.isKRW })));
     var cryptoTickers = [];
     holdings.forEach((h) => { if (h.isCrypto && cryptoTickers.indexOf(h.ticker) === -1) cryptoTickers.push(h.ticker); });
 
@@ -1249,8 +1259,14 @@ function PortfolioConsole() {
     for (var i = 0; i < stockTargets.length; i++) {
       var tgt = stockTargets[i];
       try {
-        var r = await Promise.all([apiQuote(tgt.ticker), apiMetric(tgt.ticker)]);
-        applyToList(tgt.scope, tgt.id, { price: r[0].price, dayHigh: r[0].dayHigh, metricHigh: r[1].high52, div: r[1].div });
+        var isKr = tgt.isKRW || tgt.ticker.endsWith(".KS") || tgt.ticker.endsWith(".KQ");
+        if (isKr) {
+          var q = await apiQuote(tgt.ticker, true);
+          applyToList(tgt.scope, tgt.id, { price: q.price, dayHigh: q.dayHigh, metricHigh: q.high52, div: null });
+        } else {
+          var r = await Promise.all([apiQuote(tgt.ticker, false), apiMetric(tgt.ticker)]);
+          applyToList(tgt.scope, tgt.id, { price: r[0].price, dayHigh: r[0].dayHigh, metricHigh: r[1].high52, div: r[1].div });
+        }
       } catch (e) {
         failed.push(tgt.ticker);
       }
